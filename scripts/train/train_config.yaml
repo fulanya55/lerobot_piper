@@ -1,0 +1,307 @@
+dataset:
+  repo_id:
+    - Agilex_Split_Aloha_box_storage_chopsticks
+    - Agilex_Split_Aloha_cap_the_pen_a
+    - Agilex_Split_Aloha_catch_the_ball
+    - Agilex_Split_Aloha_classification_of_fruits_and_vegetables
+    - Agilex_Split_Aloha_classification_of_fruits_and_vegetables_a
+    - Agilex_Split_Aloha_classification_of_tableware
+    - Agilex_Split_Aloha_clean_blackboard
+    - Agilex_Split_Aloha_clean_up_the_tableware
+    - Agilex_Split_Aloha_clear_the_desktop
+    - Agilex_Split_Aloha_close_book
+    - Agilex_Split_Aloha_close_button
+    - Agilex_Split_Aloha_cube_reset
+    - Agilex_Split_Aloha_cut_banana
+    - Agilex_Split_Aloha_desktop_organization
+    - Agilex_Split_Aloha_drawer_storage_mineral_water
+    - Agilex_Split_Aloha_fold_the_towel
+    - Agilex_Split_Aloha_fold_towel_a
+    - Agilex_Split_Aloha_food_packaging
+    - Agilex_Split_Aloha_make_fruit_salad
+    - Agilex_Split_Aloha_make_hamburger
+    - Agilex_Split_Aloha_mobile_cube
+    - Agilex_Split_Aloha_mobile_cube_blackboard
+    - Agilex_Split_Aloha_move_beverage
+    - Agilex_Split_Aloha_move_plate
+    - Agilex_Split_Aloha_move_the_ball
+    - Agilex_Split_Aloha_move_the_ball_and_the_cube_block
+    - Agilex_Split_Aloha_move_the_ball_interference
+    - Agilex_Split_Aloha_move_the_bread
+    - Agilex_Split_Aloha_move_the_cup
+    - Agilex_Split_Aloha_move_the_plate
+    - Agilex_Split_Aloha_move_the_small_ball
+    - Agilex_Split_Aloha_movethe_position_of_the_bluetooth
+    - Agilex_Split_Aloha_open_the_shoebox
+    - Agilex_Split_Aloha_place_square_pyramid
+    - Agilex_Split_Aloha_place_the_cube_block
+    - Agilex_Split_Aloha_place_the_test_tube
+    - Agilex_Split_Aloha_plate_storage_apple
+    - Agilex_Split_Aloha_plate_storage_bread
+    - Agilex_Split_Aloha_plate_storaje_baozi
+    - Agilex_Split_Aloha_pot_storage_steamer
+    - Agilex_Split_Aloha_pour_drink
+    - Agilex_Split_Aloha_pour_water_a
+    - Agilex_Split_Aloha_pour_water_bottle
+    - Agilex_Split_Aloha_prepare_breakfast
+    - Agilex_Split_Aloha_pull_zipper
+    - Agilex_Split_Aloha_pushing_magnet
+    - Agilex_Split_Aloha_put_in_the_pear
+    - Agilex_Split_Aloha_put_the_building_block_on_the_table
+    - Agilex_Split_Aloha_steamer_storage_dumpling
+    - Agilex_Split_Aloha_storage_plate
+    - Agilex_Split_Aloha_take_out_a_pen_from_the_pen_holder
+    - Agilex_Split_Aloha_take_out_the_bread
+    - Agilex_Split_Aloha_take_the_shoes_off_the_shelf
+    - Agilex_Split_Aloha_the_box_stores_table_tennis_balls
+    - Agilex_Split_Aloha_the_plate_holds_the_fruit
+    - Agilex_Split_Aloha_the_plate_holds_the_vegetables
+    - Agilex_Split_Aloha_turn_off_the_desk_lamp
+    - Agilex_Split_Aloha_turn_on_the_bulb
+    - Agilex_Split_Aloha_turn_on_the_desk_lamp
+    - Agilex_Split_Aloha_twist_bottle_cap
+    - Agilex_Split_Aloha_vase_storage_flower
+    - Agilex_Split_Aloha_water_bottle_storage
+  repo_type: dataset
+  root: /root/dataset/robocoin
+  episodes: null
+  exclude_episodes:
+    Agilex_Split_Aloha_cap_the_pen_a: [36]
+    Agilex_Split_Aloha_clear_the_desktop: [1, 89, 192]
+    Agilex_Split_Aloha_close_book: [139]
+    Agilex_Split_Aloha_close_button: [1, 44]
+    Agilex_Split_Aloha_drawer_storage_mineral_water: [2, 80]
+    Agilex_Split_Aloha_food_packaging: [640, 641, 642, 643, 644, 645, 646, 647, 648, 649, 650, 651, 652, 653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689, 690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716, 717, 718, 719, 720, 721, 722, 723, 724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734, 735, 736, 737, 738, 739, 740, 741, 742, 743, 744, 745, 746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762, 763, 764, 765, 766, 767, 768, 769, 770, 771, 772, 773, 774, 775, 776, 777, 778, 779, 780, 781, 782, 783, 784, 785, 786, 787, 788, 789, 790, 791, 792, 793, 794, 795, 796, 797, 798, 799, 800, 801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814, 815, 816, 817, 818, 819, 820, 821, 822, 823, 824, 825, 826, 827, 828, 829]
+    Agilex_Split_Aloha_fold_the_towel: [78, 144]
+    Agilex_Split_Aloha_move_the_bread: [84]
+    Agilex_Split_Aloha_open_the_shoebox: [129, 162, 163]
+    Agilex_Split_Aloha_place_the_test_tube: [90, 115, 140, 147, 149, 157, 238, 308, 330]
+    Agilex_Split_Aloha_plate_storage_bread: [99]
+    Agilex_Split_Aloha_storage_plate: [66, 72]
+    Agilex_Split_Aloha_take_out_a_pen_from_the_pen_holder: [43, 55, 105, 299, 464, 465]
+  max_episodes_per_dataset: null
+  episode_sampling_seed: 42
+  common_feature_keys:
+    - observation.state
+    - action
+  feature_rename_map:
+    observation.images.cam_high_rgb: observation.images.base_0_rgb
+    observation.images.cam_front_rgb: observation.images.base_0_rgb
+    observation.images.cam_left_wrist_rgb: observation.images.left_wrist_0_rgb
+    observation.images.cam_left_wrist_rgb_rgb: observation.images.left_wrist_0_rgb
+    observation.images.cam_right_wrist_rgb: observation.images.right_wrist_0_rgb
+    observation.images.cam_right_wrist_rgb_rgb: observation.images.right_wrist_0_rgb
+  image_transforms:
+    enable: false
+    max_num_transforms: 3
+    random_order: false
+    tfs:
+      brightness:
+        weight: 1.0
+        type: ColorJitter
+        kwargs:
+          brightness: [0.8, 1.2]
+      contrast:
+        weight: 1.0
+        type: ColorJitter
+        kwargs:
+          contrast: [0.8, 1.2]
+      saturation:
+        weight: 1.0
+        type: ColorJitter
+        kwargs:
+          saturation: [0.5, 1.5]
+      hue:
+        weight: 1.0
+        type: ColorJitter
+        kwargs:
+          hue: [-0.05, 0.05]
+      sharpness:
+        weight: 1.0
+        type: SharpnessJitter
+        kwargs:
+          sharpness: [0.5, 1.5]
+      affine:
+        weight: 1.0
+        type: RandomAffine
+        kwargs:
+          degrees: [-5.0, 5.0]
+          translate: [0.05, 0.05]
+  revision: null
+  use_imagenet_stats: true
+  video_backend: torchcodec
+  return_uint8: false
+  depth_output_unit: mm
+  streaming: false
+  eval_split: 0.0
+
+env: null
+
+policy:
+  type: pi0
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 50
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD
+    ACTION: MEAN_STD
+  input_features: {}
+  output_features: {}
+  device: cuda
+  use_amp: false
+  use_peft: false
+  push_to_hub: false
+  repo_id: null
+  private: null
+  tags: null
+  license: null
+  pretrained_path: /root/model/pi0_base
+  pretrained_revision: null
+  max_state_dim: 32
+  max_action_dim: 32
+  empty_cameras: 0
+  image_resolution: [224, 224]
+  dtype: bfloat16
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  num_inference_steps: 10
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+  use_relative_actions: false
+  relative_exclude_joints:
+    - gripper
+  action_feature_names: null
+  rtc_config: null
+  gradient_checkpointing: true
+  compile_model: false
+  compile_mode: max-autotune
+  freeze_vision_encoder: false
+  train_expert_only: false
+  optimizer_lr: 0.0001
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 0.01
+  optimizer_grad_clip_norm: 1.0
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 0.00001
+  tokenizer_max_length: 48
+
+reward_model: null
+output_dir: /root/lerobot/outputs/train/robocoin_pi0_lora
+job_name: robocoin_pi0_lora
+resume: false
+seed: 42
+cudnn_deterministic: false
+num_workers: 8
+batch_size: 2
+prefetch_factor: 2
+persistent_workers: true
+dataloader_multiprocessing_context: spawn
+steps: 30000
+env_eval_freq: 20000
+log_freq: 1
+eval_steps: 0
+max_eval_samples: 0
+tolerance_s: 0.0001
+save_checkpoint: true
+save_freq: 5000
+checkpoint_format: safetensors
+use_policy_training_preset: true
+
+optimizer:
+  type: adamw
+  lr: 0.0001
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 1000
+  num_decay_steps: 30000
+  peak_lr: 0.0001
+  decay_lr: 0.00001
+
+parallelism:
+  dp_replicate: 1
+  dp_shard: 1
+  context_parallel:
+    ring_degree: 1
+    ulysses_degree: 1
+  cfg_parallel: 1
+
+accelerator:
+  mixed_precision: "no"
+  gradient_accumulation:
+    steps: 1
+  fsdp:
+    reshard_after_forward: true
+    wrap_modules: null
+    min_num_params: null
+    cpu_offload: false
+    ignored_modules: null
+  ddp:
+    find_unused_parameters: true
+    gradient_as_bucket_view: false
+    static_graph: false
+  compile:
+    enabled: false
+    backend: inductor
+    mode: null
+    regional: true
+  activation_checkpointing:
+    mode: none
+
+eval:
+  n_episodes: 50
+  batch_size: 50
+  use_async_envs: true
+  recording: false
+  recording_repo_id: null
+  recording_private: false
+
+ema:
+  enable: false
+  decay: null
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_decay: 0.0
+  max_decay: 0.9999
+  use_for_eval: true
+
+wandb:
+  enable: true
+  disable_artifact: false
+  project: lerobot
+  entity: fulanya55-hit
+  notes: null
+  run_id: null
+  mode: null
+  add_tags: true
+
+peft:
+  target_modules: '(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))'
+  full_training_modules: []
+  method_type: LORA
+  init_type: null
+  r: 64
+  lora_alpha: 64
+
+job:
+  target: null
+  image: huggingface/lerobot-gpu:latest
+  timeout: 2d
+  detach: false
+  tags: []
+
+save_checkpoint_to_hub: false
+sample_weighting: null
+rename_map: {}
