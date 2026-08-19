@@ -51,6 +51,7 @@ from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_piper,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
@@ -62,6 +63,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
@@ -452,6 +454,9 @@ class RobotClient:
 
             return raw_observation
 
+        except DeviceNotConnectedError as e:
+            self.logger.error(f"Robot hardware became unavailable: {e}")
+            raise
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 

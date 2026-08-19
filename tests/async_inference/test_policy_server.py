@@ -18,6 +18,7 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -217,3 +218,33 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_policy_load_is_reused_for_identical_client_configuration(monkeypatch, policy_server):
+    from lerobot.async_inference import policy_server as policy_server_module
+    from lerobot.transport import services_pb2
+
+    specs = SimpleNamespace(
+        policy_type="pi0",
+        pretrained_name_or_path="/models/piper",
+        lerobot_features={},
+        actions_per_chunk=10,
+        device="cuda",
+        rename_map={},
+    )
+    monkeypatch.setattr(policy_server_module, "deserialize_policy_config", lambda _: specs)
+    load_calls = []
+
+    def fake_load(policy_specs, policy_key):
+        load_calls.append(policy_key)
+        policy_server.policy = MockPolicy()
+        policy_server._loaded_policy_key = policy_key
+
+    monkeypatch.setattr(policy_server, "_load_policy", fake_load)
+    request = services_pb2.PolicySetup(data=b"ignored")
+    context = SimpleNamespace(peer=lambda: "test-client")
+
+    policy_server.SendPolicyInstructions(request, context)
+    policy_server.SendPolicyInstructions(request, context)
+
+    assert len(load_calls) == 1
