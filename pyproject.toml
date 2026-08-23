@@ -370,9 +370,6 @@ name = "pytorch-cu118"
 url = "https://download.pytorch.org/whl/cu118"
 explicit = true
 
-[tool.uv.sources]
-torch = [{ path = "/root/.cache/uv/manual-wheels/torch-2.7.1+cu118-cp312-cp312-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux'" }]
-torchvision = [{ path = "/root/.cache/uv/manual-wheels/torchvision-0.22.1+cu118-cp312-cp312-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux'" }]
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]

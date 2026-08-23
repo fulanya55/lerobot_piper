@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
+from lerobot.datasets.dataset_tools import split_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 
@@ -78,6 +79,34 @@ def _make_v21_dataset(root: Path) -> None:
         ).to_parquet(root / "data" / "chunk-000" / f"episode_{episode_index:06d}.parquet")
 
 
+def _add_v21_fake_videos(root: Path) -> None:
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["total_videos"] = info["total_episodes"]
+    info["video_path"] = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    info["features"]["observation.images.cam"] = {
+        "dtype": "video",
+        "shape": [3, 2, 2],
+        "names": ["channels", "height", "width"],
+        "info": {
+            "video.height": 2,
+            "video.width": 2,
+            "video.codec": "h264",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "video.fps": 10,
+            "video.channels": 3,
+            "has_audio": False,
+        },
+    }
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    video_dir = root / "videos" / "chunk-000" / "observation.images.cam"
+    video_dir.mkdir(parents=True)
+    for episode_index in range(2):
+        (video_dir / f"episode_{episode_index:06d}.mp4").write_bytes(f"episode-{episode_index}".encode())
+
+
 def test_load_v21_dataset_without_conversion(tmp_path: Path) -> None:
     _make_v21_dataset(tmp_path)
 
@@ -123,3 +152,37 @@ def test_multilerobot_v21_stats_respect_selected_episodes(tmp_path: Path) -> Non
         torch.from_numpy(dataset.meta.stats["action"]["mean"]),
         torch.tensor([2.5, 2.5], dtype=torch.float64),
     )
+
+
+def test_split_v21_dataset_to_v30(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    _make_v21_dataset(source_root)
+    source = LeRobotDataset("test/v21", root=source_root)
+
+    result = split_dataset(source, {"selected": [1]}, output_dir=tmp_path / "splits")["selected"]
+
+    assert not result.meta.is_legacy_v21
+    assert result.meta.total_episodes == 1
+    assert result.meta.total_frames == 2
+    assert result.meta.get_data_file_path(0) == Path("data/chunk-000/file-000.parquet")
+    assert {int(index) for index in result.hf_dataset["episode_index"]} == {0}
+    torch.testing.assert_close(result[0]["action"], torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(
+        torch.from_numpy(result.meta.stats["action"]["mean"]),
+        torch.tensor([2.5, 2.5], dtype=torch.float64),
+    )
+
+
+def test_split_v21_dataset_copies_per_episode_videos_without_reencoding(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    _make_v21_dataset(source_root)
+    _add_v21_fake_videos(source_root)
+    source = LeRobotDataset("test/v21-video", root=source_root)
+
+    result = split_dataset(source, {"selected": [1]}, output_dir=tmp_path / "splits")["selected"]
+
+    relative_video_path = result.meta.get_video_file_path(0, "observation.images.cam")
+    assert relative_video_path == Path("videos/observation.images.cam/chunk-000/file-000.mp4")
+    assert (result.root / relative_video_path).read_bytes() == b"episode-1"
+    assert result.meta.episodes[0]["videos/observation.images.cam/from_timestamp"] == 0.0
+    assert result.meta.episodes[0]["videos/observation.images.cam/to_timestamp"] == 0.2

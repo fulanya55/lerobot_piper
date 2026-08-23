@@ -64,6 +64,7 @@ from .io_utils import (
     write_stats,
     write_tasks,
 )
+from .legacy_v21 import load_legacy_episode_stats
 from .lerobot_dataset import LeRobotDataset
 from .utils import (
     DATA_DIR,
@@ -93,6 +94,10 @@ def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> d
         dict containing episode metadata and stats
     """
     ep_meta = src_dataset.meta.episodes[episode_idx]
+    if src_dataset.meta.is_legacy_v21:
+        episode_stats = load_legacy_episode_stats(src_dataset.root, [episode_idx]).get(episode_idx, {})
+        return {**ep_meta, **flatten_dict({"stats": episode_stats})}
+
     chunk_idx = ep_meta["meta/episodes/chunk_index"]
     file_idx = ep_meta["meta/episodes/file_index"]
 
@@ -567,9 +572,14 @@ def _copy_and_reindex_data(
             df["task_index"] = df["task_index"].replace(task_mapping)
 
             first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
+            if src_dataset.meta.is_legacy_v21:
+                first_ep_new_idx = episode_mapping[first_ep_old_idx]
+                chunk_idx = first_ep_new_idx // dst_meta.chunks_size
+                file_idx = first_ep_new_idx % dst_meta.chunks_size
+            else:
+                src_ep = src_dataset.meta.episodes[first_ep_old_idx]
+                chunk_idx = src_ep["data/chunk_index"]
+                file_idx = src_ep["data/file_index"]
         else:
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
             df = df[mask].copy().reset_index(drop=True)
@@ -582,9 +592,14 @@ def _copy_and_reindex_data(
             df["task_index"] = df["task_index"].replace(task_mapping)
 
             first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
+            if src_dataset.meta.is_legacy_v21:
+                first_ep_new_idx = episode_mapping[first_ep_old_idx]
+                chunk_idx = first_ep_new_idx // dst_meta.chunks_size
+                file_idx = first_ep_new_idx % dst_meta.chunks_size
+            else:
+                src_ep = src_dataset.meta.episodes[first_ep_old_idx]
+                chunk_idx = src_ep["data/chunk_index"]
+                file_idx = src_ep["data/file_index"]
 
         dst_path = dst_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -739,6 +754,9 @@ def _copy_and_reindex_videos(
     if src_dataset.meta.episodes is None:
         src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
 
+    if src_dataset.meta.is_legacy_v21:
+        return _copy_and_reindex_legacy_v21_videos(src_dataset, dst_meta, episode_mapping)
+
     episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in episode_mapping.values()}
 
     for video_key in src_dataset.meta.video_keys:
@@ -845,6 +863,45 @@ def _copy_and_reindex_videos(
                     )
 
                     cumulative_ts += ep_duration
+
+    return episodes_video_metadata
+
+
+def _copy_and_reindex_legacy_v21_videos(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+) -> dict[int, dict]:
+    """Copy per-episode v2.1 videos into a v3 destination without re-encoding."""
+    if dst_meta.video_path is None:
+        raise ValueError("Destination metadata has no video_path defined")
+
+    episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in episode_mapping.values()}
+    for video_key in src_dataset.meta.video_keys:
+        for old_idx, new_idx in tqdm(
+            sorted(episode_mapping.items(), key=lambda item: item[1]),
+            desc=f"Processing {video_key} v2.1 videos",
+        ):
+            src_video_path = src_dataset.root / src_dataset.meta.get_video_file_path(old_idx, video_key)
+            chunk_idx = new_idx // dst_meta.chunks_size
+            file_idx = new_idx % dst_meta.chunks_size
+            dst_video_path = dst_meta.root / dst_meta.video_path.format(
+                video_key=video_key,
+                chunk_index=chunk_idx,
+                file_index=file_idx,
+            )
+            dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src_video_path, dst_video_path)
+
+            episode_length = int(src_dataset.meta.episodes[old_idx]["length"])
+            episodes_video_metadata[new_idx].update(
+                {
+                    f"videos/{video_key}/chunk_index": chunk_idx,
+                    f"videos/{video_key}/file_index": file_idx,
+                    f"videos/{video_key}/from_timestamp": 0.0,
+                    f"videos/{video_key}/to_timestamp": episode_length / src_dataset.meta.fps,
+                }
+            )
 
     return episodes_video_metadata
 

@@ -64,15 +64,21 @@ def load_legacy_episodes(root: Path, fps: int, video_keys: list[str]) -> dataset
     return datasets.Dataset.from_list(adapted_rows)
 
 
-def load_legacy_stats(root: Path, episode_indices: list[int] | None = None) -> dict | None:
-    """Aggregate selected v2.1 per-episode stats into the v3 global-stats contract."""
+def load_legacy_episode_stats(root: Path, episode_indices: list[int] | None = None) -> dict[int, dict]:
+    """Load v2.1 per-episode statistics using numpy values."""
     path = root / LEGACY_EPISODES_STATS_PATH
     if not path.exists():
-        return None
+        return {}
     rows = sorted(_load_jsonlines(path), key=lambda row: row["episode_index"])
     if episode_indices is not None:
         selected = set(episode_indices)
         rows = [row for row in rows if int(row["episode_index"]) in selected]
-    if not rows:
+    return {int(row["episode_index"]): cast_stats_to_numpy(row["stats"]) for row in rows}
+
+
+def load_legacy_stats(root: Path, episode_indices: list[int] | None = None) -> dict | None:
+    """Aggregate selected v2.1 per-episode stats into the v3 global-stats contract."""
+    episode_stats = load_legacy_episode_stats(root, episode_indices)
+    if not episode_stats:
         return None
-    return aggregate_stats([cast_stats_to_numpy(row["stats"]) for row in rows])
+    return aggregate_stats(list(episode_stats.values()))
