@@ -48,6 +48,15 @@ class BiPiperConfig(RobotConfig):
 
     # Direct SDK control settings, matching PCD-LeRobot's MOVE J path.
     velocity: int = 30
+    # Keep the MOVE_J/JointCtrl stream alive between policy or replay frames,
+    # matching the inference controller's high-rate command loop.
+    command_refresh_hz: float = 150.0
+    # Periodically repeat EnableArm(7), as required by controllers that lose
+    # joint enable while still accepting gripper commands.
+    enable_keepalive_hz: float = 10.0
+    # Inference fails closed on sustained enable loss. Dataset replay can opt
+    # into re-enable-at-current-pose and continue with the current frame.
+    recover_enable_loss: bool = False
     gripper_effort: int = 1000
     enable_timeout_s: float = 10.0
     enable_retry_interval_s: float = 0.1
@@ -111,6 +120,10 @@ class BiPiperConfig(RobotConfig):
             raise ValueError("gripper_action_unit must be 'meters' or 'open_scale'")
         if not 1 <= self.velocity <= 100:
             raise ValueError("velocity must be in [1, 100]")
+        if self.command_refresh_hz <= 0:
+            raise ValueError("command_refresh_hz must be positive")
+        if self.enable_keepalive_hz <= 0:
+            raise ValueError("enable_keepalive_hz must be positive")
         if not 0 <= self.gripper_effort <= 5000:
             raise ValueError("gripper_effort must be in [0, 5000]")
         if self.enable_timeout_s <= 0 or self.enable_retry_interval_s <= 0:

@@ -27,6 +27,9 @@ class FakeInterface:
         self.calls.append(("connect",))
         self.connected = True
 
+    def EmergencyStop(self, value):
+        self.calls.append(("emergency_stop", value))
+
     def GetArmJointMsgs(self):
         joint = SimpleNamespace(**{f"joint_{i + 1}": self.raw[i] for i in range(6)})
         return SimpleNamespace(joint_state=joint, time_stamp=self.stamp)
@@ -195,6 +198,12 @@ def test_sdk_unit_roundtrip():
     np.testing.assert_allclose(restored, model, atol=np.pi / 180000)
     np.testing.assert_array_equal(raw[:3], [0, 90000, -90000])
     assert raw[6] == 40000
+
+
+def test_sdk_connect_sends_controller_resume_handshake():
+    arm = make_sdk_arm([0] * 7)
+
+    assert arm._interface.calls[:2] == [("connect",), ("emergency_stop", 0x02)]
 
 
 @pytest.mark.parametrize(

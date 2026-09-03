@@ -77,6 +77,12 @@ class PiperSDKArm:
             raise RuntimeError(f"PiPER interface {self.can_name} is already open")
         interface = self._interface_factory(self.can_name)
         interface.ConnectPort()
+        # The verified inference controller sends the SDK resume handshake
+        # before enabling the six joint drivers. Without it, some controller
+        # firmware accepts gripper frames while ignoring JointCtrl targets.
+        resume = getattr(interface, "EmergencyStop", None)
+        if resume is not None:
+            resume(0x02)
         self._interface = interface
         self._last_feedback_stamp = None
         self._last_feedback_seen_at = 0.0

@@ -23,7 +23,7 @@ from pathlib import Path
 DEFAULT_CHECKPOINT = Path("/home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model")
 DEFAULT_DATASET_INFO = Path("/home/agilex/wxwu/data/PLACE_THE_TEST_TUBE/meta/info.json")
 DEFAULT_TASK = "Place the test tube on the test tube rack on the desk with the gripper."
-DEFAULT_V21_CONVERTER = Path("/home/agilex/wxwu/script/hdf5_to_lerobot_v2.py")
+DEFAULT_V21_CONVERTER = Path("/home/agilex/wxwu/lerobot_piper/script/hdf5_to_lerobot_v2.py")
 DEFAULT_V21_PYTHON = Path("/home/agilex/miniconda3/envs/lerobot/bin/python")
 METER_ACTION_NAMES = tuple(
     f"{side}_{name}"

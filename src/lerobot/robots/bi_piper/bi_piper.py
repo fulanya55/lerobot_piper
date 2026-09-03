@@ -56,6 +56,9 @@ class BiPiper(Robot):
         self._rospy: Any = None
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        self._command_refresh_stop = threading.Event()
+        self._command_refresh_thread: threading.Thread | None = None
+        self._command_target_physical: np.ndarray | None = None
         self._fatal_error: str | None = None
         self.last_requested_action: dict[str, float] | None = None
         self.last_sent_action: dict[str, float] | None = None
@@ -250,8 +253,29 @@ class BiPiper(Robot):
         self._arms["left"].command(left)
         self._arms["right"].command(right)
 
+    def _command_refresh_loop(self) -> None:
+        interval = 1.0 / self.config.command_refresh_hz
+        enable_interval = 1.0 / self.config.enable_keepalive_hz
+        next_enable_refresh = time.monotonic()
+        while not self._command_refresh_stop.wait(interval):
+            try:
+                with self._command_lock:
+                    now = time.monotonic()
+                    if now >= next_enable_refresh:
+                        for arm in self._arms.values():
+                            arm.request_enable()
+                        next_enable_refresh = now + enable_interval
+                    if self._command_target_physical is not None and self._fatal_error is None:
+                        target = self._command_target_physical.copy()
+                        self._send_locked(target[:7], target[7:])
+            except Exception as exc:
+                self._fatal_error = f"PiPER command refresh failed: {exc}"
+                logger.exception(self._fatal_error)
+                return
+
     def _hold_current_locked(self) -> None:
         current = self._read_both()
+        self._command_target_physical = current.copy()
         self._send_locked(current[:7], current[7:])
         self._reset_trajectory(current)
 
@@ -282,10 +306,10 @@ class BiPiper(Robot):
                 with self._command_lock:
                     enable_lost, status = self._confirmed_enable_loss_locked()
                     if enable_lost:
-                        logger.critical(
-                            "PiPER enable lost; recovering at current pose and aborting this rollout"
-                        )
+                        logger.warning("PiPER enable lost; recovering at current pose")
                         self._ensure_enabled_locked(hold_after=True)
+                        if self.config.recover_enable_loss:
+                            continue
                         self._fatal_error = (
                             "PiPER motor enable was lost during inference. The arms were re-enabled at the "
                             "measured pose; inspect the hardware and restart the client."
@@ -390,6 +414,11 @@ class BiPiper(Robot):
                     target=self._watchdog_loop, name="bi-piper-enable-watchdog", daemon=True
                 )
                 self._watchdog_thread.start()
+                self._command_refresh_stop.clear()
+                self._command_refresh_thread = threading.Thread(
+                    target=self._command_refresh_loop, name="bi-piper-command-refresh", daemon=True
+                )
+                self._command_refresh_thread.start()
         except Exception:
             self._release_ros_handles()
             self._disconnect_arms()
@@ -514,12 +543,16 @@ class BiPiper(Robot):
                 if enable_lost:
                     self._reset_trajectory(current)
                     self._ensure_enabled_locked(hold_after=True)
-                    self._fatal_error = (
-                        "PiPER motor enable was lost before an action. The arms were re-enabled at the "
-                        "measured pose; the old action queue must not continue."
-                    )
-                    raise DeviceNotConnectedError(self._fatal_error)
+                    if not self.config.recover_enable_loss:
+                        self._fatal_error = (
+                            "PiPER motor enable was lost before an action. The arms were re-enabled at the "
+                            "measured pose; the old action queue must not continue."
+                        )
+                        raise DeviceNotConnectedError(self._fatal_error)
+                    current = self._read_both()
+                    safe_physical = self._clip_action(requested_physical, current)
                 self._send_locked(safe_physical[:7], safe_physical[7:])
+                self._command_target_physical = safe_physical.copy()
 
         safe_policy = self._physical_to_policy_units(safe_physical)
         sent = {
@@ -557,6 +590,10 @@ class BiPiper(Robot):
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        self._command_refresh_stop.set()
+        if self._command_refresh_thread is not None:
+            self._command_refresh_thread.join(timeout=2.0)
+            self._command_refresh_thread = None
         self._watchdog_stop.set()
         if self._watchdog_thread is not None:
             self._watchdog_thread.join(timeout=2.0)
