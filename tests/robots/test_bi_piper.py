@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import lerobot.robots.bi_piper.bi_piper as bi_piper_module
 from lerobot.robots.bi_piper import BiPiper, BiPiperConfig
 from lerobot.robots.bi_piper.bi_piper import ACTION_FEATURES
 from lerobot.robots.bi_piper.piper_sdk_arm import PiperSDKArm
@@ -72,8 +73,8 @@ def make_sdk_arm(raw: list[int], *, enabled: bool = True) -> PiperSDKArm:
     return arm
 
 
-def make_connected_robot(*, dry_run: bool = False, enabled: bool = True):
-    config = BiPiperConfig(id="test", dry_run=dry_run, enable_retry_interval_s=0.001)
+def make_connected_robot(*, dry_run: bool = False, enabled: bool = True, **config_kwargs):
+    config = BiPiperConfig(id="test", dry_run=dry_run, enable_retry_interval_s=0.001, **config_kwargs)
     robot = BiPiper(config)
     raw = [0, 90000, -90000, 0, 0, 0, 40000]
     robot._arms = {
@@ -87,8 +88,102 @@ def make_connected_robot(*, dry_run: bool = False, enabled: bool = True):
 def test_features_match_checkpoint_order():
     robot = BiPiper(BiPiperConfig(id="test"))
 
+    assert list(ACTION_FEATURES) == [
+        "left_joint_1",
+        "left_joint_2",
+        "left_joint_3",
+        "left_joint_4",
+        "left_joint_5",
+        "left_joint_6",
+        "left_gripper",
+        "right_joint_1",
+        "right_joint_2",
+        "right_joint_3",
+        "right_joint_4",
+        "right_joint_5",
+        "right_joint_6",
+        "right_gripper",
+    ]
     assert list(robot.action_features) == list(ACTION_FEATURES)
     assert list(robot.observation_features)[:14] == list(ACTION_FEATURES)
+
+
+def test_replay_config_supports_direct_can_without_ros_cameras():
+    robot = BiPiper(BiPiperConfig(id="replay", camera_topics={}))
+
+    assert robot.config.camera_topics == {}
+    assert list(robot.observation_features) == list(ACTION_FEATURES)
+
+
+def test_replay_connect_without_cameras_does_not_import_ros(monkeypatch):
+    class FakeArm:
+        def __init__(self, *args, **kwargs):
+            self.connected = False
+
+        @property
+        def is_connected(self):
+            return self.connected
+
+        def connect(self):
+            self.connected = True
+
+        def disconnect(self, *, disable=False):
+            self.connected = False
+
+        def state(self):
+            return np.zeros(7)
+
+    monkeypatch.setattr(bi_piper_module, "PiperSDKArm", FakeArm)
+    monkeypatch.setattr(
+        BiPiper,
+        "_import_ros",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("ROS import is not expected"))),
+    )
+    monkeypatch.setattr(BiPiper, "_check_exclusive_can_ownership_without_ros", lambda self: None)
+    robot = BiPiper(BiPiperConfig(id="replay", camera_topics={}, dry_run=True))
+
+    robot.connect()
+
+    assert robot.is_connected
+    assert robot._rospy is None
+    assert robot.get_observation() == dict.fromkeys(ACTION_FEATURES, 0.0)
+    robot.disconnect()
+
+
+def test_legacy_pi0_gripper_scale_is_converted_to_sdk_metres():
+    legacy_names = tuple(
+        f"{side}_{name}"
+        for side in ("left", "right")
+        for name in (
+            "arm_joint_1_rad",
+            "arm_joint_2_rad",
+            "arm_joint_3_rad",
+            "arm_joint_4_rad",
+            "arm_joint_5_rad",
+            "arm_joint_6_rad",
+            "gripper_open_scale",
+        )
+    )
+    robot = make_connected_robot(
+        action_feature_names=legacy_names,
+        gripper_action_unit="open_scale",
+        max_gripper_step_m=0.1,
+    )
+    current_physical = robot._read_both()
+    current_policy = robot._physical_to_policy_units(current_physical)
+    assert current_policy[6] == pytest.approx(0.5)
+    assert current_policy[13] == pytest.approx(0.5)
+    action = {name: float(value) for name, value in zip(legacy_names, current_policy, strict=True)}
+    action[legacy_names[6]] = 0.75
+    action[legacy_names[13]] = 0.75
+
+    sent = robot.send_action(action)
+
+    assert sent[legacy_names[6]] == pytest.approx(0.75)
+    assert sent[legacy_names[13]] == pytest.approx(0.75)
+    np.testing.assert_allclose(robot.last_sent_physical_action[[6, 13]], [0.06, 0.06])
+    for arm in robot._arms.values():
+        assert ("gripper", 60000, 1000, 0x01, 0x00) in arm._interface.calls
 
 
 def test_sdk_unit_roundtrip():
@@ -126,6 +221,58 @@ def test_action_is_clipped_to_joint_limits_and_measured_slew():
     np.testing.assert_allclose(sent_values, current + expected_step)
 
 
+def test_trajectory_smoothing_limits_velocity_and_acceleration():
+    robot = make_connected_robot(
+        dry_run=True,
+        trajectory_smoothing=True,
+        policy_fps=30,
+        max_joint_step_rad=1.0,
+        max_joint_velocity_rad_s=1.0,
+        max_joint_acceleration_rad_s2=4.0,
+    )
+    current = robot._read_both()
+    requested = current.copy()
+    requested[[0, 7]] += 1.0
+    action = {name: float(value) for name, value in zip(ACTION_FEATURES, requested, strict=True)}
+
+    first = robot.send_action(action)
+    first_values = np.asarray([first[name] for name in ACTION_FEATURES])
+    second = robot.send_action(action)
+    second_values = np.asarray([second[name] for name in ACTION_FEATURES])
+
+    expected_first_step = 4.0 / 30**2
+    expected_second_step = 3.0 * expected_first_step
+    np.testing.assert_allclose(first_values[[0, 7]], current[[0, 7]] + expected_first_step)
+    np.testing.assert_allclose(second_values[[0, 7]], current[[0, 7]] + expected_second_step)
+    assert robot.last_measured_action is not None
+
+
+def test_trajectory_smoothing_does_not_reverse_velocity_in_one_frame():
+    robot = make_connected_robot(
+        dry_run=True,
+        trajectory_smoothing=True,
+        policy_fps=30,
+        max_joint_step_rad=1.0,
+        max_joint_velocity_rad_s=1.0,
+        max_joint_acceleration_rad_s2=4.0,
+    )
+    current = robot._read_both()
+    positive = current.copy()
+    positive[0] += 1.0
+    negative = current.copy()
+    negative[0] -= 1.0
+
+    robot.send_action({name: float(value) for name, value in zip(ACTION_FEATURES, positive, strict=True)})
+    before_reverse = robot.send_action(
+        {name: float(value) for name, value in zip(ACTION_FEATURES, positive, strict=True)}
+    )
+    after_reverse = robot.send_action(
+        {name: float(value) for name, value in zip(ACTION_FEATURES, negative, strict=True)}
+    )
+
+    assert after_reverse[ACTION_FEATURES[0]] > before_reverse[ACTION_FEATURES[0]]
+
+
 def test_partial_or_non_finite_action_is_rejected():
     robot = make_connected_robot(dry_run=True)
 
@@ -152,6 +299,18 @@ def test_send_action_uses_move_j_joint_and_gripper_for_both_arms():
         assert ("motion", 0x01, 0x01, 30, 0x00) in calls
         assert ("joint", 0, 90000, -90000, 0, 0, 0) in calls
         assert ("gripper", 40000, 1000, 0x01, 0x00) in calls
+
+
+def test_periodic_hold_sends_measured_pose_and_recovers_enable():
+    robot = make_connected_robot(enabled=False)
+
+    held = robot.hold_current()
+
+    assert list(held) == list(ACTION_FEATURES)
+    for arm in robot._arms.values():
+        assert ("enable",) in arm._interface.calls
+        assert ("joint", 0, 90000, -90000, 0, 0, 0) in arm._interface.calls
+        assert ("gripper", 40000, 1000, 0x01, 0x00) in arm._interface.calls
 
 
 def test_lost_enable_recovers_hold_then_aborts_old_action_queue():

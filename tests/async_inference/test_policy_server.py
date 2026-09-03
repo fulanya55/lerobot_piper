@@ -248,3 +248,39 @@ def test_policy_load_is_reused_for_identical_client_configuration(monkeypatch, p
     policy_server.SendPolicyInstructions(request, context)
 
     assert len(load_calls) == 1
+
+
+def test_policy_server_can_disable_checkpoint_compile(monkeypatch, policy_server):
+    from lerobot.async_inference import policy_server as policy_server_module
+
+    policy_server.config.compile_model = False
+    policy_server.policy_type = "pi05"
+    fake_config = SimpleNamespace(compile_model=True)
+    loaded_configs = []
+
+    class FakePolicyClass:
+        @classmethod
+        def from_pretrained(cls, _path, *, config):
+            loaded_configs.append(config)
+            return MockPolicy()
+
+    monkeypatch.setattr(
+        policy_server_module.PreTrainedConfig,
+        "from_pretrained",
+        lambda _path: fake_config,
+    )
+    monkeypatch.setattr(policy_server_module, "get_policy_class", lambda _policy_type: FakePolicyClass)
+    monkeypatch.setattr(
+        policy_server_module,
+        "make_pre_post_processors",
+        lambda *_args, **_kwargs: (SimpleNamespace(steps=[]), object()),
+    )
+    specs = SimpleNamespace(
+        pretrained_name_or_path="/models/piper",
+        rename_map={},
+    )
+
+    policy_server._load_policy(specs, ("pi05", "/models/piper"))
+
+    assert loaded_configs == [fake_config]
+    assert fake_config.compile_model is False

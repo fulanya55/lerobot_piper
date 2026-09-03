@@ -37,6 +37,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
@@ -172,7 +173,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        policy_config = PreTrainedConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+        checkpoint_compile_model = getattr(policy_config, "compile_model", None)
+        if self.config.compile_model is not None and hasattr(policy_config, "compile_model"):
+            policy_config.compile_model = self.config.compile_model
+            self.logger.info(
+                "torch.compile override: checkpoint=%s, effective=%s",
+                checkpoint_compile_model,
+                policy_config.compile_model,
+            )
+        policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            config=policy_config,
+        )
         policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device

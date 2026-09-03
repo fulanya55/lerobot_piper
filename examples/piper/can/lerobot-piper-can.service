@@ -1,0 +1,12 @@
+[Unit]
+Description=Configure stable dual-PiPER CAN names and bitrate
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lerobot-piper-can-up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

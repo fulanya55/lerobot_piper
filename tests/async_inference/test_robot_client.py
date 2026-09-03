@@ -19,6 +19,7 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import threading
 import time
 from queue import Queue
 
@@ -233,6 +234,127 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_ready_to_send_observation_allows_only_one_inference_request(robot_client):
+    robot_client.action_chunk_size = 20
+    robot_client.action_queue = Queue()
+    for action in _make_actions(start_ts=time.time(), start_t=0, count=8):
+        robot_client.action_queue.put(action)
+
+    with robot_client._inference_request_lock:
+        robot_client._inference_request_started_at = time.monotonic()
+
+    assert robot_client._ready_to_send_observation() is False
+
+
+def test_expired_inference_request_can_be_retried(robot_client):
+    robot_client.action_chunk_size = 20
+    robot_client.action_queue = Queue()
+    for action in _make_actions(start_ts=time.time(), start_t=0, count=8):
+        robot_client.action_queue.put(action)
+    with robot_client._inference_request_lock:
+        robot_client._inference_request_started_at = (
+            time.monotonic() - robot_client.config.inference_request_timeout_s - 0.1
+        )
+
+    assert robot_client._ready_to_send_observation() is True
+    assert robot_client._inference_request_started_at is None
+
+
+def test_chunk_transition_preserves_prefix_then_smoothly_blends(robot_client):
+    from lerobot.async_inference.helpers import TimedAction
+
+    robot_client.config.action_commit_steps = 2
+    robot_client.config.action_blend_steps = 3
+    robot_client.latest_action = 4
+    now = time.time()
+    for timestep in range(5, 10):
+        robot_client.action_queue.put(TimedAction(timestamp=now, timestep=timestep, action=torch.zeros(6)))
+    incoming = [
+        TimedAction(timestamp=now, timestep=timestep, action=torch.full((6,), 10.0))
+        for timestep in range(5, 11)
+    ]
+
+    robot_client._aggregate_action_queues(incoming, aggregate_fn=lambda _old, new: new)
+
+    actions = {action.get_timestep(): action.get_action() for action in robot_client.action_queue.queue}
+    assert torch.allclose(actions[5], torch.zeros(6))
+    assert torch.allclose(actions[6], torch.zeros(6))
+    assert torch.allclose(actions[7], torch.full((6,), 10.0 * (7 / 27)))
+    assert torch.allclose(actions[8], torch.full((6,), 10.0 * (20 / 27)))
+    assert torch.allclose(actions[9], torch.full((6,), 10.0))
+    assert torch.allclose(actions[10], torch.full((6,), 10.0))
+
+
+def test_action_tensor_dimension_must_match_robot_joint_interface(robot_client):
+    expected_dim = len(robot_client.robot.action_features)
+
+    with pytest.raises(ValueError, match=f"flat {expected_dim}D tensor"):
+        robot_client._action_tensor_to_action_dict(torch.zeros(expected_dim + 1))
+
+
+def test_control_loop_can_bound_number_of_policy_actions(robot_client, monkeypatch):
+    performed = []
+    robot_client.start_barrier = type("BarrierStub", (), {"wait": lambda self: None})()
+    monkeypatch.setattr(robot_client, "actions_available", lambda: True)
+    monkeypatch.setattr(
+        robot_client,
+        "control_loop_action",
+        lambda verbose=False: performed.append(len(performed)) or {"action": len(performed)},
+    )
+    monkeypatch.setattr(robot_client, "_ready_to_send_observation", lambda: False)
+    monkeypatch.setattr("lerobot.async_inference.robot_client.time.sleep", lambda _: None)
+
+    robot_client.control_loop(task="test", max_actions=3)
+
+    assert len(performed) == 3
+
+
+def test_control_loop_records_pre_action_observation_and_performed_action(robot_client, monkeypatch):
+    recorded = []
+    observation = {"state": 1.0}
+    timestamps = {"state": 123}
+    robot_client.start_barrier = type("BarrierStub", (), {"wait": lambda self: None})()
+    monkeypatch.setattr(robot_client, "actions_available", lambda: True)
+    monkeypatch.setattr(robot_client.robot, "get_observation", lambda: observation)
+    monkeypatch.setattr(robot_client.robot, "last_observation_timestamps_ns", timestamps, raising=False)
+    monkeypatch.setattr(
+        robot_client,
+        "control_loop_action",
+        lambda verbose=False: {"safe_action": 2.0},
+    )
+    monkeypatch.setattr(robot_client, "_ready_to_send_observation", lambda: False)
+    monkeypatch.setattr("lerobot.async_inference.robot_client.time.sleep", lambda _: None)
+
+    robot_client.control_loop(
+        task="test",
+        max_actions=1,
+        frame_callback=lambda obs, action, stamps, action_time: recorded.append(
+            (obs, action, stamps, action_time)
+        ),
+    )
+
+    assert recorded[0][:3] == (observation, {"safe_action": 2.0}, timestamps)
+    assert isinstance(recorded[0][3], int)
+
+
+def test_control_loop_stop_event_prevents_next_action(robot_client, monkeypatch):
+    stop_event = threading.Event()
+    stop_event.set()
+    robot_client.start_barrier = type("BarrierStub", (), {"wait": lambda self: None})()
+    monkeypatch.setattr(
+        robot_client,
+        "control_loop_action",
+        lambda verbose=False: pytest.fail("an action was executed after stop"),
+    )
+
+    robot_client.control_loop(task="test", stop_event=stop_event)
+
+
+def test_control_loop_rejects_nonpositive_action_bound(robot_client):
+    with pytest.raises(ValueError, match="max_actions must be positive"):
+        robot_client.control_loop(task="test", max_actions=0)
 
 
 # -----------------------------------------------------------------------------

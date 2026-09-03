@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly BITRATE=1000000
+readonly LEFT_SERIAL=002100355631511920313857
+readonly RIGHT_SERIAL=002800175746570A20383839
+
+find_can_by_serial() {
+    local expected_serial="$1"
+    local interface_path interface serial
+
+    for interface_path in /sys/class/net/can*; do
+        [[ -e "$interface_path" ]] || continue
+        interface="${interface_path##*/}"
+        serial="$(udevadm info -q property -p "$interface_path" | sed -n 's/^ID_SERIAL_SHORT=//p')"
+        if [[ "$serial" == "$expected_serial" ]]; then
+            printf '%s\n' "$interface"
+            return 0
+        fi
+    done
+    return 1
+}
+
+configure_can() {
+    local expected_serial="$1"
+    local desired_name="$2"
+    local interface
+
+    if ! interface="$(find_can_by_serial "$expected_serial")"; then
+        echo "Missing PiPER CAN adapter serial=$expected_serial ($desired_name)" >&2
+        return 1
+    fi
+
+    if [[ "$interface" != "$desired_name" ]]; then
+        if [[ -e "/sys/class/net/$desired_name" ]]; then
+            echo "Refusing to replace existing interface $desired_name" >&2
+            return 1
+        fi
+        ip link set "$interface" down
+        ip link set "$interface" name "$desired_name"
+    fi
+
+    ip link set "$desired_name" down
+    ip link set "$desired_name" type can bitrate "$BITRATE"
+    ip link set "$desired_name" up
+    ip -details link show "$desired_name"
+}
+
+configure_can "$LEFT_SERIAL" can_left
+configure_can "$RIGHT_SERIAL" can_right

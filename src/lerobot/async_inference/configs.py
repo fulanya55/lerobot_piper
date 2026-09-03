@@ -64,6 +64,13 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # ``None`` preserves the checkpoint setting. Set this explicitly for
+    # deployments where startup latency matters more than compiled throughput.
+    compile_model: bool | None = field(
+        default=None,
+        metadata={"help": "Override a policy checkpoint's torch.compile setting"},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -96,6 +103,7 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "compile_model": self.compile_model,
         }
 
 
@@ -136,6 +144,35 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+
+    # Keep at most one policy request in flight. This prevents a fast control
+    # loop from enqueuing several nearby observations while one slow inference
+    # is still running, which otherwise produces back-to-back replans.
+    inference_request_timeout_s: float = field(
+        default=5.0,
+        metadata={"help": "Retry a policy request after this many seconds without a returned chunk"},
+    )
+    force_inference_on_prefetch: bool = field(
+        default=True,
+        metadata={"help": "Do not let server-side observation similarity filtering drop a prefetch"},
+    )
+
+    # When a new chunk overlaps queued actions, preserve the immediate prefix
+    # and cross-fade the following steps. Zero values preserve the historical
+    # aggregation behavior.
+    action_commit_steps: int = field(
+        default=0,
+        metadata={"help": "Number of overlapping near-term actions kept unchanged"},
+    )
+    action_blend_steps: int = field(
+        default=0,
+        metadata={"help": "Number of overlapping actions blended with a smoothstep transition"},
+    )
+
+    action_telemetry_path: str | None = field(
+        default=None,
+        metadata={"help": "Optional JSONL path for requested, sent, and measured action telemetry"},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -179,6 +216,12 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.inference_request_timeout_s <= 0:
+            raise ValueError("inference_request_timeout_s must be positive")
+
+        if self.action_commit_steps < 0 or self.action_blend_steps < 0:
+            raise ValueError("Action commit/blend steps must be non-negative")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -200,4 +243,9 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "inference_request_timeout_s": self.inference_request_timeout_s,
+            "force_inference_on_prefetch": self.force_inference_on_prefetch,
+            "action_commit_steps": self.action_commit_steps,
+            "action_blend_steps": self.action_blend_steps,
+            "action_telemetry_path": self.action_telemetry_path,
         }

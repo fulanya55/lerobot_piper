@@ -33,11 +33,13 @@ python src/lerobot/async_inference/robot_client.py \
 ```
 """
 
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Queue
 from typing import Any
@@ -138,6 +140,18 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        self._inference_request_lock = threading.Lock()
+        self._inference_request_started_at: float | None = None
+        self._queue_starved = False
+
+        self._telemetry_lock = threading.Lock()
+        self._telemetry_stream = None
+        if config.action_telemetry_path:
+            telemetry_path = Path(config.action_telemetry_path).expanduser()
+            telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            self._telemetry_stream = telemetry_path.open("a", encoding="utf-8", buffering=1)
+            self.logger.info("Action telemetry: %s", telemetry_path.resolve())
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -178,6 +192,11 @@ class RobotClient:
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
+
+        with self._telemetry_lock:
+            if self._telemetry_stream is not None:
+                self._telemetry_stream.close()
+                self._telemetry_stream = None
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
@@ -234,34 +253,61 @@ class RobotClient:
             def aggregate_fn(x1, x2):
                 return x2
 
-        future_action_queue = Queue()
+        with self.latest_action_lock:
+            latest_action = self.latest_action
         with self.action_queue_lock:
-            internal_queue = self.action_queue.queue
+            current_actions = list(self.action_queue.queue)
 
-        current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
+        current_by_timestep = {
+            action.get_timestep(): action
+            for action in current_actions
+            if action.get_timestep() > latest_action
+        }
+        incoming_by_timestep = {
+            action.get_timestep(): action
+            for action in incoming_actions
+            if action.get_timestep() > latest_action
+        }
+        overlap = sorted(current_by_timestep.keys() & incoming_by_timestep.keys())
+        overlap_index = {timestep: index for index, timestep in enumerate(overlap)}
 
-        for new_action in incoming_actions:
-            with self.latest_action_lock:
-                latest_action = self.latest_action
+        # Always leave at least one overlapping step for blending when overlap
+        # exists. This avoids an abrupt old-prefix -> new-only boundary when a
+        # delayed inference leaves fewer overlap steps than requested.
+        effective_commit = min(self.config.action_commit_steps, max(0, len(overlap) - 1))
+        effective_blend = min(
+            self.config.action_blend_steps,
+            max(0, len(overlap) - effective_commit),
+        )
 
-            # New action is older than the latest action in the queue, skip it
-            if new_action.get_timestep() <= latest_action:
-                continue
-
-            # If the new action's timestep is not in the current action queue, add it directly
-            elif new_action.get_timestep() not in current_action_queue:
+        future_action_queue = Queue()
+        for timestep in sorted(current_by_timestep.keys() | incoming_by_timestep.keys()):
+            old_action = current_by_timestep.get(timestep)
+            new_action = incoming_by_timestep.get(timestep)
+            if old_action is None:
                 future_action_queue.put(new_action)
                 continue
+            if new_action is None:
+                future_action_queue.put(old_action)
+                continue
 
-            # If the new action's timestep is in the current action queue, aggregate it
-            # TODO: There is probably a way to do this with broadcasting of the two action tensors
+            index = overlap_index[timestep]
+            if index < effective_commit:
+                future_action_queue.put(old_action)
+                continue
+
+            if index < effective_commit + effective_blend and effective_blend > 0:
+                progress = (index - effective_commit + 1) / effective_blend
+                weight_new = progress * progress * (3.0 - 2.0 * progress)
+                blended = (1.0 - weight_new) * old_action.get_action() + weight_new * new_action.get_action()
+            else:
+                blended = aggregate_fn(old_action.get_action(), new_action.get_action())
+
             future_action_queue.put(
                 TimedAction(
                     timestamp=new_action.get_timestamp(),
-                    timestep=new_action.get_timestep(),
-                    action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
+                    timestep=timestep,
+                    action=blended,
                 )
             )
 
@@ -287,6 +333,9 @@ class RobotClient:
                 deserialize_start = time.perf_counter()
                 timed_actions = deserialize_timed_actions(actions_chunk.data)
                 deserialize_time = time.perf_counter() - deserialize_start
+                if not timed_actions:
+                    self.logger.warning("Received an empty deserialized action chunk")
+                    continue
 
                 # Log device type of received actions
                 if len(timed_actions) > 0:
@@ -304,28 +353,27 @@ class RobotClient:
                     self.logger.debug(f"Actions kept on device: {client_device}")
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+                with self.latest_action_lock:
+                    latest_action_before_update = self.latest_action
+                with self.action_queue_lock:
+                    queue_before_update = [action.get_timestep() for action in self.action_queue.queue]
+                incoming_timesteps = [action.get_timestep() for action in timed_actions]
 
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:
-                    with self.latest_action_lock:
-                        latest_action = self.latest_action
-
-                    self.logger.debug(f"Current latest action: {latest_action}")
+                    self.logger.debug(f"Current latest action: {latest_action_before_update}")
 
                     # Get queue state before changes
                     old_size, old_timesteps = self._inspect_action_queue()
                     if not old_timesteps:
-                        old_timesteps = [latest_action]  # queue was empty
-
-                    # Log incoming actions
-                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
+                        old_timesteps = [latest_action_before_update]  # queue was empty
 
                     first_action_timestep = timed_actions[0].get_timestep()
                     server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
 
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
-                        f"Latest action: #{latest_action} | "
+                        f"Latest action: #{latest_action_before_update} | "
                         f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
                         f"Network latency (server->client): {server_to_client_latency:.2f}ms | "
                         f"Deserialization time: {deserialize_time * 1000:.2f}ms"
@@ -335,6 +383,34 @@ class RobotClient:
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
+
+                with self.action_queue_lock:
+                    queue_after_update = [action.get_timestep() for action in self.action_queue.queue]
+                with self._inference_request_lock:
+                    request_age_s = (
+                        None
+                        if self._inference_request_started_at is None
+                        else time.monotonic() - self._inference_request_started_at
+                    )
+                    self._inference_request_started_at = None
+
+                self._write_action_telemetry(
+                    {
+                        "event": "chunk_received",
+                        "wall_time": time.time(),
+                        "monotonic_time": time.monotonic(),
+                        "latest_action_before_update": latest_action_before_update,
+                        "incoming_first": incoming_timesteps[0],
+                        "incoming_last": incoming_timesteps[-1],
+                        "queue_before_first": queue_before_update[0] if queue_before_update else None,
+                        "queue_before_last": queue_before_update[-1] if queue_before_update else None,
+                        "queue_before_size": len(queue_before_update),
+                        "queue_after_first": queue_after_update[0] if queue_after_update else None,
+                        "queue_after_last": queue_after_update[-1] if queue_after_update else None,
+                        "queue_after_size": len(queue_after_update),
+                        "request_age_s": request_age_s,
+                    }
+                )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
@@ -366,6 +442,12 @@ class RobotClient:
             return not self.action_queue.empty()
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
+        expected_dim = len(self.robot.action_features)
+        if action_tensor.ndim != 1 or action_tensor.numel() != expected_dim:
+            raise ValueError(
+                f"Policy action must be a flat {expected_dim}D tensor matching the robot joint interface; "
+                f"got shape {tuple(action_tensor.shape)}"
+            )
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
@@ -380,11 +462,23 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        requested_action = self._action_tensor_to_action_dict(timed_action.get_action())
+        _performed_action = self.robot.send_action(requested_action)
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+
+        self._write_action_telemetry(
+            {
+                "event": "action",
+                "wall_time": time.time(),
+                "monotonic_time": time.monotonic(),
+                "action_timestep": timed_action.get_timestep(),
+                "queue_size_after_pop": self.action_queue.qsize(),
+                "requested_action": requested_action,
+                "performed_action": _performed_action,
+                "measured_action": getattr(self.robot, "last_measured_action", None),
+            }
+        )
 
         if verbose:
             with self.action_queue_lock:
@@ -404,15 +498,35 @@ class RobotClient:
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
+        with self._inference_request_lock:
+            request_started_at = self._inference_request_started_at
+            if request_started_at is not None:
+                request_age = time.monotonic() - request_started_at
+                if request_age <= self.config.inference_request_timeout_s:
+                    return False
+                self.logger.warning(
+                    "Policy request timed out after %.2fs; allowing one retry",
+                    request_age,
+                )
+                self._inference_request_started_at = None
+
         with self.action_queue_lock:
+            if self.action_chunk_size <= 0:
+                return True
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def control_loop_observation(
+        self,
+        task: str,
+        verbose: bool = False,
+        raw_observation: RawObservation | None = None,
+    ) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
+            if raw_observation is None:
+                raw_observation = self.robot.get_observation()
             raw_observation["task"] = task
 
             with self.latest_action_lock:
@@ -426,12 +540,21 @@ class RobotClient:
 
             obs_capture_time = time.perf_counter() - start_time
 
-            # If there are no actions left in the queue, the observation must go through processing!
+            # A strategically selected prefetch must not be discarded by the
+            # server's generic joint-state similarity filter.
             with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                queue_empty = self.action_queue.empty()
+                observation.must_go = self.config.force_inference_on_prefetch or (
+                    self.must_go.is_set() and queue_empty
+                )
                 current_queue_size = self.action_queue.qsize()
 
-            _ = self.send_observation(observation)
+            with self._inference_request_lock:
+                self._inference_request_started_at = time.monotonic()
+            sent = self.send_observation(observation)
+            if not sent:
+                with self._inference_request_lock:
+                    self._inference_request_started_at = None
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
@@ -458,26 +581,84 @@ class RobotClient:
             self.logger.error(f"Robot hardware became unavailable: {e}")
             raise
         except Exception as e:
+            with self._inference_request_lock:
+                self._inference_request_started_at = None
             self.logger.error(f"Error in observation sender: {e}")
 
-    def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
-        """Combined function for executing actions and streaming observations"""
+    def _write_action_telemetry(self, payload: dict[str, Any]) -> None:
+        with self._telemetry_lock:
+            if self._telemetry_stream is None:
+                return
+            self._telemetry_stream.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+
+    def control_loop(
+        self,
+        task: str,
+        verbose: bool = False,
+        max_actions: int | None = None,
+        *,
+        frame_callback: Callable[[RawObservation, Action, dict[str, int] | None, int], None] | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> tuple[Observation, Action]:
+        """Execute actions and stream observations, optionally recording each command frame."""
+        if max_actions is not None and max_actions <= 0:
+            raise ValueError(f"max_actions must be positive, got {max_actions}")
+
         # Wait at barrier for synchronized start
         self.start_barrier.wait()
         self.logger.info("Control loop thread starting")
 
         _performed_action = None
         _captured_observation = None
+        performed_actions = 0
 
         while self.running:
+            if stop_event is not None and stop_event.is_set():
+                self.logger.info("Operator requested inference stop before the next command")
+                break
             control_loop_start = time.perf_counter()
+            recording_observation = None
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
+                if frame_callback is not None:
+                    recording_observation = self.robot.get_observation()
+                    recording_timestamps = getattr(self.robot, "last_observation_timestamps_ns", None)
+                    if recording_timestamps is not None:
+                        recording_timestamps = dict(recording_timestamps)
+                self._queue_starved = False
                 _performed_action = self.control_loop_action(verbose)
+                performed_actions += 1
+                if frame_callback is not None:
+                    assert recording_observation is not None
+                    frame_callback(
+                        recording_observation,
+                        _performed_action,
+                        recording_timestamps,
+                        time.time_ns(),
+                    )
+                if max_actions is not None and performed_actions >= max_actions:
+                    self.logger.info(
+                        "Bounded policy trial complete after %d action(s); stopping before the next command",
+                        performed_actions,
+                    )
+                    break
+            elif performed_actions > 0 and not self._queue_starved:
+                self._queue_starved = True
+                self.logger.warning("Action queue starved after action #%d", self.latest_action)
+                self._write_action_telemetry(
+                    {
+                        "event": "queue_starved",
+                        "wall_time": time.time(),
+                        "monotonic_time": time.monotonic(),
+                        "latest_action": self.latest_action,
+                    }
+                )
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                _captured_observation = self.control_loop_observation(
+                    task, verbose, raw_observation=recording_observation
+                )
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

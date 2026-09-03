@@ -2,9 +2,11 @@
 
 import contextlib
 import logging
+import os
 import sys
 import threading
 import time
+import xmlrpc.client
 from functools import cached_property
 from typing import Any
 
@@ -20,10 +22,11 @@ from .piper_sdk_arm import PiperSDKArm, model_to_raw, raw_to_model
 
 logger = logging.getLogger(__name__)
 
-JOINT_NAMES = tuple(f"arm_joint_{index}_rad" for index in range(1, 7)) + ("gripper_open_scale",)
+JOINT_NAMES = tuple(f"joint_{index}" for index in range(1, 7)) + ("gripper",)
 LEFT_FEATURES = tuple(f"left_{name}" for name in JOINT_NAMES)
 RIGHT_FEATURES = tuple(f"right_{name}" for name in JOINT_NAMES)
 ACTION_FEATURES = LEFT_FEATURES + RIGHT_FEATURES
+
 
 class BiPiper(Robot):
     """Control two PiPER arms directly through piper-sdk while reading ROS cameras.
@@ -48,6 +51,7 @@ class BiPiper(Robot):
         self._arms: dict[str, PiperSDKArm] = {}
         self._images: dict[str, np.ndarray] = {}
         self._image_times: dict[str, float] = {}
+        self._image_source_times_ns: dict[str, int] = {}
         self._subscribers: list[Any] = []
         self._rospy: Any = None
         self._watchdog_stop = threading.Event()
@@ -55,10 +59,15 @@ class BiPiper(Robot):
         self._fatal_error: str | None = None
         self.last_requested_action: dict[str, float] | None = None
         self.last_sent_action: dict[str, float] | None = None
+        self.last_measured_action: dict[str, float] | None = None
+        self.last_sent_physical_action: np.ndarray | None = None
+        self.last_observation_timestamps_ns: dict[str, int] | None = None
+        self._trajectory_position: np.ndarray | None = None
+        self._trajectory_velocity: np.ndarray | None = None
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
-        state_features = dict.fromkeys(ACTION_FEATURES, float)
+        state_features = dict.fromkeys(self.config.action_feature_names, float)
         image_features = dict.fromkeys(
             self.config.camera_topics, (self.config.image_height, self.config.image_width, 3)
         )
@@ -66,7 +75,7 @@ class BiPiper(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return dict.fromkeys(ACTION_FEATURES, float)
+        return dict.fromkeys(self.config.action_feature_names, float)
 
     @property
     def is_connected(self) -> bool:
@@ -98,7 +107,9 @@ class BiPiper(Robot):
             import rospy
             from sensor_msgs.msg import Image
         except ImportError as exc:
-            raise ImportError("Direct PiPER deployment still requires ROS Noetic for RealSense images") from exc
+            raise ImportError(
+                "Direct PiPER deployment still requires ROS Noetic for RealSense images"
+            ) from exc
         return rospy, rosnode, Image
 
     @staticmethod
@@ -139,11 +150,50 @@ class BiPiper(Robot):
         with self._image_lock:
             self._images[name] = image
             self._image_times[name] = time.monotonic()
+            try:
+                self._image_source_times_ns[name] = int(message.header.stamp.to_nsec())
+            except (AttributeError, TypeError, ValueError):
+                self._image_source_times_ns[name] = time.time_ns()
 
     def _check_exclusive_can_ownership(self, rosnode: Any) -> None:
         if not self.config.reject_piper_ros_nodes:
             return
         nodes = rosnode.get_node_names()
+        conflicts = sorted(
+            node
+            for node in nodes
+            if any(fragment in node for fragment in self.config.conflicting_ros_node_fragments)
+        )
+        if conflicts:
+            raise RuntimeError(
+                "Direct PiPER control requires exclusive CAN ownership. Stop the PiPER ROS nodes first: "
+                + ", ".join(conflicts)
+            )
+
+    def _check_exclusive_can_ownership_without_ros(self) -> None:
+        """Reject known PiPER ROS CAN owners without requiring a ROS node.
+
+        A replay-only adapter has no camera topics and therefore should not
+        require a ROS master.  If a master is available, query its system state
+        directly so the same arm-node exclusion still applies.
+        """
+        if not self.config.reject_piper_ros_nodes:
+            return
+        master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+        try:
+            code, _, state = xmlrpc.client.ServerProxy(master_uri).getSystemState(
+                "/lerobot_bi_piper_direct_replay"
+            )
+        except (OSError, xmlrpc.client.Error):
+            return
+        if code != 1:
+            return
+        nodes = {
+            node
+            for registrations in state
+            for _, registered_nodes in registrations
+            for node in registered_nodes
+        }
         conflicts = sorted(
             node
             for node in nodes
@@ -163,6 +213,20 @@ class BiPiper(Robot):
 
     def _read_both(self) -> np.ndarray:
         return np.concatenate((self._read_side("left"), self._read_side("right")))
+
+    def _physical_to_policy_units(self, values: np.ndarray) -> np.ndarray:
+        converted = np.asarray(values, dtype=np.float64).copy()
+        if self.config.gripper_action_unit == "open_scale":
+            span = self.config.gripper_upper_m - self.config.gripper_lower_m
+            converted[[6, 13]] = (converted[[6, 13]] - self.config.gripper_lower_m) / span
+        return converted
+
+    def _policy_to_physical_units(self, values: np.ndarray) -> np.ndarray:
+        converted = np.asarray(values, dtype=np.float64).copy()
+        if self.config.gripper_action_unit == "open_scale":
+            span = self.config.gripper_upper_m - self.config.gripper_lower_m
+            converted[[6, 13]] = self.config.gripper_lower_m + converted[[6, 13]] * span
+        return converted
 
     def _enable_status(self) -> dict[str, list[bool]]:
         return {side: arm.enable_status() for side, arm in self._arms.items()}
@@ -189,6 +253,11 @@ class BiPiper(Robot):
     def _hold_current_locked(self) -> None:
         current = self._read_both()
         self._send_locked(current[:7], current[7:])
+        self._reset_trajectory(current)
+
+    def _reset_trajectory(self, current: np.ndarray | None = None) -> None:
+        self._trajectory_position = None if current is None else np.asarray(current, dtype=np.float64).copy()
+        self._trajectory_velocity = None if current is None else np.zeros(14, dtype=np.float64)
 
     def _ensure_enabled_locked(self, *, hold_after: bool) -> None:
         deadline = time.monotonic() + self.config.enable_timeout_s
@@ -213,7 +282,9 @@ class BiPiper(Robot):
                 with self._command_lock:
                     enable_lost, status = self._confirmed_enable_loss_locked()
                     if enable_lost:
-                        logger.critical("PiPER enable lost; recovering at current pose and aborting this rollout")
+                        logger.critical(
+                            "PiPER enable lost; recovering at current pose and aborting this rollout"
+                        )
                         self._ensure_enabled_locked(hold_after=True)
                         self._fatal_error = (
                             "PiPER motor enable was lost during inference. The arms were re-enabled at the "
@@ -241,26 +312,32 @@ class BiPiper(Robot):
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
         self._fatal_error = None
+        self.last_observation_timestamps_ns = None
+        self._reset_trajectory()
         with self._image_lock:
             self._images.clear()
             self._image_times.clear()
-        rospy, rosnode, image_cls = self._import_ros()
-        self._rospy = rospy
-        if not rospy.core.is_initialized():
-            rospy.init_node(self.config.ros_node_name, anonymous=True, disable_signals=True)
-        self._check_exclusive_can_ownership(rosnode)
+            self._image_source_times_ns.clear()
+        if self.config.camera_topics:
+            rospy, rosnode, image_cls = self._import_ros()
+            self._rospy = rospy
+            if not rospy.core.is_initialized():
+                rospy.init_node(self.config.ros_node_name, anonymous=True, disable_signals=True)
+            self._check_exclusive_can_ownership(rosnode)
 
-        for name, topic in self.config.camera_topics.items():
-            self._subscribers.append(
-                rospy.Subscriber(
-                    topic,
-                    image_cls,
-                    self._image_callback,
-                    callback_args=name,
-                    queue_size=self.config.subscriber_queue_size,
-                    tcp_nodelay=True,
+            for name, topic in self.config.camera_topics.items():
+                self._subscribers.append(
+                    rospy.Subscriber(
+                        topic,
+                        image_cls,
+                        self._image_callback,
+                        callback_args=name,
+                        queue_size=self.config.subscriber_queue_size,
+                        tcp_nodelay=True,
+                    )
                 )
-            )
+        else:
+            self._check_exclusive_can_ownership_without_ros()
 
         try:
             self._arms = {
@@ -295,15 +372,16 @@ class BiPiper(Robot):
                 with self._command_lock:
                     self._ensure_enabled_locked(hold_after=True)
 
-            deadline = time.monotonic() + self.config.connect_timeout_s
-            while time.monotonic() < deadline:
-                with self._image_lock:
-                    cameras_ready = set(self._images) == set(self.config.camera_topics)
-                if cameras_ready:
-                    break
-                time.sleep(0.05)
-            else:
-                raise TimeoutError("Timed out waiting for the three ROS RealSense RGB streams")
+            if self.config.camera_topics:
+                deadline = time.monotonic() + self.config.connect_timeout_s
+                while time.monotonic() < deadline:
+                    with self._image_lock:
+                        cameras_ready = set(self._images) == set(self.config.camera_topics)
+                    if cameras_ready:
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise TimeoutError("Timed out waiting for the three ROS RealSense RGB streams")
 
             self._connected = True
             if not self.config.dry_run:
@@ -326,18 +404,31 @@ class BiPiper(Robot):
             raise DeviceNotConnectedError(self._fatal_error)
         with self._command_lock:
             state = self._read_both()
+            state_time_ns = time.time_ns()
         with self._image_lock:
             images = {name: image.copy() for name, image in self._images.items()}
             image_times = dict(self._image_times)
+            image_source_times_ns = dict(self._image_source_times_ns)
         now = time.monotonic()
-        stale_images = [name for name, stamp in image_times.items() if now - stamp > self.config.max_image_age_s]
+        stale_images = [
+            name for name, stamp in image_times.items() if now - stamp > self.config.max_image_age_s
+        ]
         if stale_images:
             raise DeviceNotConnectedError(f"Stale PiPER camera data: {', '.join(stale_images)}")
 
         observation: RobotObservation = {
-            name: float(value) for name, value in zip(ACTION_FEATURES, state, strict=True)
+            name: float(value)
+            for name, value in zip(
+                self.config.action_feature_names,
+                self._physical_to_policy_units(state),
+                strict=True,
+            )
         }
         observation.update(images)
+        self.last_observation_timestamps_ns = {
+            **image_source_times_ns,
+            "state": state_time_ns,
+        }
         return observation
 
     def _clip_action(self, requested: np.ndarray, current: np.ndarray) -> np.ndarray:
@@ -349,41 +440,120 @@ class BiPiper(Robot):
         slew_one_arm = np.asarray(
             (*(self.config.max_joint_step_rad for _ in range(6)), self.config.max_gripper_step_m)
         )
-        return np.clip(bounded, current - np.tile(slew_one_arm, 2), current + np.tile(slew_one_arm, 2))
+        slew = np.tile(slew_one_arm, 2)
+        if not self.config.trajectory_smoothing:
+            return np.clip(bounded, current - slew, current + slew)
+
+        if self._trajectory_position is None or self._trajectory_velocity is None:
+            self._reset_trajectory(current)
+        assert self._trajectory_position is not None
+        assert self._trajectory_velocity is not None
+
+        dt = 1.0 / self.config.policy_fps
+        velocity_one_arm = np.asarray(
+            (*(self.config.max_joint_velocity_rad_s for _ in range(6)), self.config.max_gripper_velocity_m_s)
+        )
+        acceleration_one_arm = np.asarray(
+            (
+                *(self.config.max_joint_acceleration_rad_s2 for _ in range(6)),
+                self.config.max_gripper_acceleration_m_s2,
+            )
+        )
+        max_velocity = np.tile(velocity_one_arm, 2)
+        max_acceleration = np.tile(acceleration_one_arm, 2)
+
+        error = bounded - self._trajectory_position
+        desired_velocity = np.clip(error / dt, -max_velocity, max_velocity)
+        velocity = np.clip(
+            desired_velocity,
+            self._trajectory_velocity - max_acceleration * dt,
+            self._trajectory_velocity + max_acceleration * dt,
+        )
+        step = velocity * dt
+        # Snap only when moving toward the target would pass it. If a newly
+        # requested target is behind the current motion, retain the limited
+        # velocity and decelerate across subsequent frames instead of jumping.
+        overshoot = (step * error >= 0) & (np.abs(step) > np.abs(error))
+        step[overshoot] = error[overshoot]
+
+        candidate = self._trajectory_position + step
+        # Measured-relative clipping is retained only as the final hardware
+        # safety envelope. Under normal tracking it does not shape the path.
+        safe = np.clip(candidate, current - slew, current + slew)
+        safe = np.clip(safe, lower, upper)
+        self._trajectory_velocity = (safe - self._trajectory_position) / dt
+        self._trajectory_position = safe.copy()
+        return safe
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         if self._fatal_error is not None:
             raise DeviceNotConnectedError(self._fatal_error)
-        missing = [name for name in ACTION_FEATURES if name not in action]
+        missing = [name for name in self.config.action_feature_names if name not in action]
         if missing:
             raise ValueError(f"PiPER action is missing features: {missing}")
-        requested = np.asarray([action[name] for name in ACTION_FEATURES], dtype=np.float64)
-        if not np.isfinite(requested).all():
+        requested_policy = np.asarray(
+            [action[name] for name in self.config.action_feature_names], dtype=np.float64
+        )
+        if not np.isfinite(requested_policy).all():
             raise ValueError("PiPER action contains NaN or infinity")
+        requested_physical = self._policy_to_physical_units(requested_policy)
 
         with self._command_lock:
             if self._fatal_error is not None:
                 raise DeviceNotConnectedError(self._fatal_error)
             current = self._read_both()
-            safe = self._clip_action(requested, current)
+            measured_policy = self._physical_to_policy_units(current)
+            self.last_measured_action = {
+                name: float(value)
+                for name, value in zip(self.config.action_feature_names, measured_policy, strict=True)
+            }
+            safe_physical = self._clip_action(requested_physical, current)
             if not self.config.dry_run:
                 enable_lost, _ = self._confirmed_enable_loss_locked()
                 if enable_lost:
+                    self._reset_trajectory(current)
                     self._ensure_enabled_locked(hold_after=True)
                     self._fatal_error = (
                         "PiPER motor enable was lost before an action. The arms were re-enabled at the "
                         "measured pose; the old action queue must not continue."
                     )
                     raise DeviceNotConnectedError(self._fatal_error)
-                self._send_locked(safe[:7], safe[7:])
+                self._send_locked(safe_physical[:7], safe_physical[7:])
 
-        sent = {name: float(value) for name, value in zip(ACTION_FEATURES, safe, strict=True)}
+        safe_policy = self._physical_to_policy_units(safe_physical)
+        sent = {
+            name: float(value)
+            for name, value in zip(self.config.action_feature_names, safe_policy, strict=True)
+        }
         self.last_requested_action = {
-            name: float(value) for name, value in zip(ACTION_FEATURES, requested, strict=True)
+            name: float(value)
+            for name, value in zip(self.config.action_feature_names, requested_policy, strict=True)
         }
         self.last_sent_action = sent
+        self.last_sent_physical_action = safe_physical.copy()
         return sent
+
+    @check_if_not_connected
+    def hold_current(self) -> RobotAction:
+        """Continuously callable measured-pose hold used between live actions.
+
+        A single MOVE J target is not a durable holding guarantee on every
+        controller firmware. Callers that need the arm to remain supported
+        should invoke this method periodically while the CAN connection stays
+        open.
+        """
+        with self._command_lock:
+            enable_lost, _ = self._confirmed_enable_loss_locked()
+            if enable_lost:
+                self._ensure_enabled_locked(hold_after=False)
+            current = self._read_both()
+            self._send_locked(current[:7], current[7:])
+            self._reset_trajectory(current)
+        policy = self._physical_to_policy_units(current)
+        return {
+            name: float(value) for name, value in zip(self.config.action_feature_names, policy, strict=True)
+        }
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -407,6 +577,10 @@ class BiPiper(Robot):
             self._disconnect_arms()
             self._connected = False
         logger.info(
-            "BiPiper disconnected; motors %s",
-            "left enabled at the last hold target" if self.config.keep_enabled_on_disconnect else "disabled",
+            "BiPiper disconnected; %s",
+            (
+                "DisableArm was not sent, but CAN closure may still cause controller-side enable loss"
+                if self.config.keep_enabled_on_disconnect
+                else "DisableArm was requested"
+            ),
         )

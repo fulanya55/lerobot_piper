@@ -43,12 +43,15 @@ lerobot-replay \
 
 import logging
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 from lerobot.configs import parser
 from lerobot.datasets import LeRobotDataset
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.processor import (
     make_default_robot_action_processor,
 )
@@ -56,6 +59,7 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_openarm_follower,
+    bi_piper,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
@@ -99,6 +103,31 @@ class ReplayConfig:
     play_sounds: bool = True
 
 
+def load_replay_dataset(cfg: DatasetReplayConfig) -> LeRobotDataset:
+    """Load the episode selected by a replay configuration.
+
+    Keeping this in the CLI module gives safety wrappers a single entry point
+    with the same local/Hub dataset semantics as ``lerobot-replay``.
+    """
+    return LeRobotDataset(cfg.repo_id, root=cfg.root, episodes=[cfg.episode])
+
+
+def process_replay_action(
+    action_array: Sequence[Any],
+    action_names: Sequence[str],
+    robot_observation: RobotObservation,
+    robot_action_processor: Callable[[tuple[RobotAction, RobotObservation]], RobotAction],
+) -> RobotAction:
+    """Map one dataset action row and process it exactly as the replay CLI does."""
+    if len(action_array) != len(action_names):
+        raise ValueError(
+            f"Replay action has {len(action_array)} values but the dataset declares "
+            f"{len(action_names)} action names"
+        )
+    action = {name: action_array[i] for i, name in enumerate(action_names)}
+    return robot_action_processor((action, robot_observation))
+
+
 @parser.wrap()
 def replay(cfg: ReplayConfig):
     init_logging()
@@ -107,7 +136,7 @@ def replay(cfg: ReplayConfig):
     robot_action_processor = make_default_robot_action_processor()
 
     robot = make_robot_from_config(cfg.robot)
-    dataset = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, episodes=[cfg.dataset.episode])
+    dataset = load_replay_dataset(cfg.dataset)
 
     actions = dataset.select_columns(ACTION)
 
@@ -118,14 +147,13 @@ def replay(cfg: ReplayConfig):
         for idx in range(dataset.num_frames):
             start_episode_t = time.perf_counter()
 
-            action_array = actions[idx][ACTION]
-            action = {}
-            for i, name in enumerate(dataset.features[ACTION]["names"]):
-                action[name] = action_array[i]
-
             robot_obs = robot.get_observation()
-
-            processed_action = robot_action_processor((action, robot_obs))
+            processed_action = process_replay_action(
+                actions[idx][ACTION],
+                dataset.features[ACTION]["names"],
+                robot_obs,
+                robot_action_processor,
+            )
 
             _ = robot.send_action(processed_action)
 
