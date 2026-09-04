@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Direct ROS -> LeRobot v3 collector. MP4 and Parquet are written while recording.
+# Direct ROS -> LeRobot v2.1 collector. MP4 and Parquet are written while recording.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 PIPER_WS="/home/agilex/cobot_magic/Piper_ros_private-ros-noetic"
 CAMERA_WS="/home/agilex/cobot_magic/camera_ws"
@@ -9,6 +9,7 @@ CONDA_SH="/home/agilex/miniconda3/etc/profile.d/conda.sh"
 ALOHA_PYTHON="/home/agilex/miniconda3/envs/aloha/bin/python"
 UV_BIN="/home/agilex/miniconda3/envs/aloha/bin/uv"
 LEROBOT_DIR="$ROOT_DIR/lerobot_piper"
+WRITER_SCRIPT="examples/piper/lerobot_v21_stream_writer.py"
 DATASET_PATH="$ROOT_DIR/data/piper_lerobot_direct_v2"
 REPO_ID="local/piper_dual_arm"
 TASK="dual-arm manipulation"
@@ -112,7 +113,7 @@ fi
 WRITER_ARGS=(--socket "$SOCKET_PATH" --dataset-path "$DATASET_PATH" --repo-id "$REPO_ID" --task "$TASK" --episode-idx "$EPISODE_IDX" --fps "$FPS" --video-codec "$VIDEO_CODEC" --video-crf "$VIDEO_CRF")
 [[ "$CONTINUOUS" == true ]] && WRITER_ARGS+=(--continuous --episode-file "$EPISODE_FILE")
 WRITER_CMD="$(printf '%q ' "${WRITER_ARGS[@]}")"
-setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' run --frozen --extra dataset python examples/piper/lerobot_stream_writer.py $WRITER_CMD" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
+setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' run --frozen --extra dataset python '$WRITER_SCRIPT' $WRITER_CMD" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
 for _ in $(seq 1 40); do [[ -S "$SOCKET_PATH" ]] && break; sleep .1; done
 echo "等待 ROS 话题……日志：$LOG_DIR"
 sleep 4
