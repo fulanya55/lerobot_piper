@@ -147,7 +147,11 @@ def main():
             set_state(args.state_file, "recording")
             period = 1.0 / args.fps
             next_tick = time.monotonic()
-            sequence = -1
+            # Do not replay the last frame of the previous episode.  The
+            # synchronizer stays alive between episodes, so start after its
+            # current sequence and wait for a genuinely new synchronized
+            # sample.
+            sequence = source.current_sequence()
             count = 0
             last_frame_time = time.monotonic()
             shutdown_requested = False

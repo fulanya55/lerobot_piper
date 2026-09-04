@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import queue
 import socket
 import struct
+import threading
 from pathlib import Path
 
 import av
@@ -59,8 +61,9 @@ class Writer:
         self.first = first
         self.episode_index = args.episode_idx
         self.buffers = None
-        self.containers = []
-        self.streams = []
+        self.image_queues = []
+        self.image_workers = []
+        self.encode_errors = []
         self._open_dataset()
 
     def _open_dataset(self):
@@ -102,16 +105,51 @@ class Writer:
         ep, chunk = self.episode_index, self.episode_index // 1000
         self.buffers = {key: [] for key in ("observation.state", "observation.velocity",
                                             "observation.effort", "observation.timestamps_ns", "action")}
-        self.containers, self.streams = [], []
+        self.image_queues, self.image_workers, self.encode_errors = [], [], []
         for camera, image in zip(CAMERAS, self.first["images"], strict=True):
             key = f"observation.images.{camera}"
             path = self.root / "videos" / f"chunk-{chunk:03d}" / key / f"episode_{ep:06d}.mp4"
             path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep only a short bounded backlog; the workers normally stay
+            # ahead of the 30 FPS producer while avoiding unbounded RAM use.
+            images = queue.Queue(maxsize=30)
+            self.image_queues.append(images)
+            worker = threading.Thread(target=self._encode_camera,
+                                      args=(images, path, image.shape[1], image.shape[0]),
+                                      daemon=True)
+            self.image_workers.append(worker)
+            worker.start()
+
+    def _encode_camera(self, images, path, width, height):
+        try:
             container = av.open(str(path), "w", options={"movflags": "faststart"})
-            stream = container.add_stream("libx264", rate=self.args.fps, options={"crf": str(self.args.video_crf)})
-            stream.width, stream.height, stream.pix_fmt = image.shape[1], image.shape[0], "yuv420p"
+            stream = container.add_stream(
+                "libx264", rate=self.args.fps,
+                options={"crf": str(self.args.video_crf), "preset": "ultrafast", "threads": "2"},
+            )
+            stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
             stream.gop_size = 2
-            self.containers.append(container); self.streams.append(stream)
+            while True:
+                image = images.get()
+                try:
+                    if image is None:
+                        break
+                    for packet in stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
+                        container.mux(packet)
+                finally:
+                    images.task_done()
+            for packet in stream.encode():
+                container.mux(packet)
+            container.close()
+        except Exception as exc:
+            self.encode_errors.append(exc)
+            # Unblock save() if a codec/container failure occurs.
+            while True:
+                try:
+                    images.get_nowait()
+                    images.task_done()
+                except queue.Empty:
+                    break
 
     def add(self, frame):
         if self.buffers is None:
@@ -120,17 +158,21 @@ class Writer:
                             ("observation.effort", "effort"), ("observation.timestamps_ns", "timestamps_ns"),
                             ("action", "action")):
             self.buffers[key].append(np.asarray(frame[source]))
-        for image, container, stream in zip(frame["images"], self.containers, self.streams, strict=True):
-            video_frame = av.VideoFrame.from_ndarray(image, format="rgb24")
-            for packet in stream.encode(video_frame): container.mux(packet)
+        for image, images in zip(frame["images"], self.image_queues, strict=True):
+            images.put(image, block=True)
 
     def save(self):
         if not self.buffers or not self.buffers["action"]:
             return
         length, ep, chunk = len(self.buffers["action"]), self.episode_index, self.episode_index // 1000
-        for container, stream in zip(self.containers, self.streams, strict=True):
-            for packet in stream.encode(): container.mux(packet)
-            container.close()
+        for images in self.image_queues:
+            images.put(None, block=True)
+        for images in self.image_queues:
+            images.join()
+        for worker in self.image_workers:
+            worker.join()
+        if self.encode_errors:
+            raise RuntimeError(f"视频编码失败: {self.encode_errors[0]}")
         start = int(self.info["total_frames"])
         table = {key: pa.array([value.tolist() for value in values]) for key, values in self.buffers.items()}
         table.update({"timestamp": pa.array(np.arange(length, dtype=np.float32) / self.args.fps),
@@ -146,7 +188,7 @@ class Writer:
         append_jsonl(self.root / "meta/episodes_stats.jsonl", {"episode_index": ep, "stats": stats})
         self.info["total_episodes"] = ep + 1; self.info["total_frames"] = start + length
         self.info["splits"] = {"train": f"0:{ep + 1}"}; write_json(self.info_path, self.info)
-        self.episode_index += 1; self.buffers = None; self.containers = []; self.streams = []
+        self.episode_index += 1; self.buffers = None; self.image_queues = []; self.image_workers = []
 
 
 def main():

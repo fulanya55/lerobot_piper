@@ -150,6 +150,10 @@ class SynchronizedFrameSource:
                 return None, previous_sequence
             return self.latest, self.sequence
 
+    def current_sequence(self):
+        with self.lock:
+            return self.sequence
+
 
 class HDF5EpisodeWriter:
     def __init__(self, path, max_frames, fps, first_frame):
