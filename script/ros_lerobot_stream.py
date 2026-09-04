@@ -146,7 +146,11 @@ def main():
                     last_frame_time = time.monotonic()
                     print(f"\r已采集 {count}/{args.timesteps} 帧", end="", flush=True)
                 elif time.monotonic() - last_frame_time > args.stale_timeout:
-                    raise RuntimeError("同步数据停止更新")
+                    if args.continuous:
+                        print("同步帧暂时空窗，继续等待……", flush=True)
+                        last_frame_time = time.monotonic()
+                    else:
+                        raise RuntimeError("同步数据停止更新")
                 next_tick += period
                 delay = next_tick - time.monotonic()
                 if delay > 0:
