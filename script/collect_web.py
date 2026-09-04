@@ -10,6 +10,7 @@ DIRECT = ROOT / "lerobot_piper/script/direct_collect.sh"
 SERVICES = ROOT / "lerobot_piper/script/start_robot_services.sh"
 PREVIEW = ROOT / "lerobot_piper/script/ros_preview_server.py"
 ALOHA = "/home/agilex/miniconda3/envs/aloha/bin/python"
+ROS_SETUP = "source /opt/ros/noetic/setup.bash; source /home/agilex/cobot_magic/camera_ws/devel/setup.bash; source /home/agilex/cobot_magic/Piper_ros_private-ros-noetic/devel/setup.bash"
 DEFAULT_DATASET = ROOT / "data/piper_lerobot_direct"
 services_proc = preview_proc = capture_proc = None
 preview_external = False
@@ -52,7 +53,8 @@ def start_services():
                 preview_external = True
         except OSError:
             preview_external = False
-            preview_proc=subprocess.Popen([ALOHA,str(PREVIEW)],start_new_session=True,stdout=(services_log/'preview.log').open('a'),stderr=subprocess.STDOUT)
+            preview_cmd=f"{ROS_SETUP}; exec '{ALOHA}' '{PREVIEW}'"
+            preview_proc=subprocess.Popen(['bash','-lc',preview_cmd],start_new_session=True,stdout=(services_log/'preview.log').open('w'),stderr=subprocess.STDOUT)
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self,d,code=200):
