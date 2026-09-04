@@ -20,6 +20,9 @@ VIDEO_CRF=23
 SKIP_CAN=false
 NO_PREVIEW=true
 AUTO_START=false
+CONTINUOUS=false
+CONTROL_FILE=""
+STATE_FILE=""
 YES=false
 
 usage() {
@@ -36,6 +39,7 @@ usage() {
   --skip-can            不执行 can_config.sh
   --no-preview          不启动相机预览窗口
   --auto-start          不等待 Enter，收到首帧后立即录制
+  --continuous          采集完成后保持 ROS 同步，等待下一条 episode
   --yes                 跳过人工确认
 EOF
 }
@@ -54,6 +58,7 @@ while (($#)); do
     --skip-can) SKIP_CAN=true; shift;;
     --no-preview) NO_PREVIEW=true; shift;;
     --auto-start) AUTO_START=true; shift;;
+    --continuous) CONTINUOUS=true; shift;;
     --yes) YES=true; shift;;
     -h|--help) usage; exit 0;;
     *) echo "未知参数: $1" >&2; usage >&2; exit 2;;
@@ -73,11 +78,16 @@ if [[ "$SKIP_CAN" != true ]]; then sudo bash "$PIPER_WS/can_config.sh"; fi
 
 SOCKET_PATH="$(mktemp -u /tmp/piper_lerobot_stream.XXXXXX)"
 LOG_DIR="$(mktemp -d /tmp/piper_direct_logs.XXXXXX)"
+if [[ "$CONTINUOUS" == true ]]; then
+  CONTROL_FILE="${PIPER_CONTROL_FILE:-$(mktemp -u /tmp/piper_collect_control.XXXXXX)}"
+  STATE_FILE="${CONTROL_FILE}.state"
+  [[ -p "$CONTROL_FILE" ]] || mkfifo "$CONTROL_FILE"
+fi
 PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
-  rm -f "$SOCKET_PATH"
+  rm -f "$SOCKET_PATH" "$CONTROL_FILE" "$STATE_FILE"
 }
 trap cleanup EXIT INT TERM
 ROS_SETUP="source /opt/ros/noetic/setup.bash; source '$CAMERA_WS/devel/setup.bash'; source '$PIPER_WS/devel/setup.bash'"
@@ -104,6 +114,7 @@ echo "等待 ROS 话题……日志：$LOG_DIR"
 sleep 4
 STREAM_ARGS=(--socket "$SOCKET_PATH" --timesteps "$TIMESTEPS" --fps "$FPS" --sync-slop 0.10)
 [[ "$AUTO_START" == true ]] && STREAM_ARGS+=(--auto-start)
+[[ "$CONTINUOUS" == true ]] && STREAM_ARGS+=(--continuous --control-file "$CONTROL_FILE" --state-file "$STATE_FILE")
 set +u
 eval "$ROS_SETUP"
 set -u

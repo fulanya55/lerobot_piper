@@ -86,6 +86,7 @@ def main():
     p.add_argument("--video-codec", default="h264")
     p.add_argument("--video-crf", type=int, default=23)
     p.add_argument("--encoder-threads", type=int, default=2)
+    p.add_argument("--continuous", action="store_true")
     args = p.parse_args()
     path = Path(args.socket)
     path.unlink(missing_ok=True)
@@ -96,6 +97,10 @@ def main():
     conn, _ = server.accept()
     stream = conn.makefile("rb")
     first = recv_packet(stream)
+    while isinstance(first, dict) and "_control" in first:
+        if first["_control"] == "shutdown":
+            raise RuntimeError("录制尚未开始就收到 shutdown")
+        first = recv_packet(stream)
     if first is None:
         raise RuntimeError("未收到任何帧")
     dataset = open_dataset(args, first)
@@ -103,6 +108,17 @@ def main():
     try:
         frame = first
         while frame is not None:
+            if isinstance(frame, dict) and "_control" in frame:
+                control = frame["_control"]
+                if control == "episode_end":
+                    if count:
+                        dataset.save_episode(parallel_encoding=False)
+                        print(f"\n保存 episode frames={count}", flush=True)
+                        count = 0
+                    frame = recv_packet(stream)
+                    continue
+                if control == "shutdown":
+                    break
             dataset.add_frame({
                 "observation.state": np.asarray(frame["qpos"], dtype=np.float32),
                 "observation.velocity": np.asarray(frame["qvel"], dtype=np.float32),
@@ -118,9 +134,10 @@ def main():
             if count % 30 == 0:
                 print(f"\rwriter frames: {count}", end="", flush=True)
             frame = recv_packet(stream)
-        dataset.save_episode(parallel_encoding=False)
+        if count:
+            dataset.save_episode(parallel_encoding=False)
         dataset.finalize()
-        print(f"\n保存完成：{args.dataset_path} episode={args.episode_idx} frames={count}", flush=True)
+        print(f"\n保存完成：{args.dataset_path}", flush=True)
     finally:
         conn.close()
         server.close()

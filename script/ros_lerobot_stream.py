@@ -5,6 +5,7 @@ The ROS Noetic environment sends synchronized frames to the uv-based writer
 over a local Unix socket. No HDF5 staging is used.
 """
 import argparse
+import os
 import pickle
 import select
 import socket
@@ -28,6 +29,9 @@ def parse_args():
     p.add_argument("--stale-timeout", type=float, default=5.0)
     p.add_argument("--sync-slop", type=float, default=0.10)
     p.add_argument("--auto-start", action="store_true")
+    p.add_argument("--continuous", action="store_true")
+    p.add_argument("--control-file")
+    p.add_argument("--state-file")
     p.add_argument("--img-front-topic", default="/camera_f/color/image_raw")
     p.add_argument("--img-left-topic", default="/camera_l/color/image_raw")
     p.add_argument("--img-right-topic", default="/camera_r/color/image_raw")
@@ -41,6 +45,31 @@ def parse_args():
 def send_packet(stream, payload):
     data = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     stream.sendall(struct.pack("!Q", len(data)) + data)
+
+
+def set_state(path, value):
+    if path:
+        Path(path).write_text(value, encoding="utf-8")
+
+
+def command_reader(path):
+    if not path:
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    return fd
+
+
+def next_command(fd, timeout=0.1):
+    if fd is None:
+        return None
+    readable, _, _ = select.select([fd], [], [], timeout)
+    if not readable:
+        return None
+    data = os.read(fd, 4096)
+    if not data:
+        return None
+    commands = data.decode(errors="replace").split()
+    return commands[-1] if commands else None
 
 
 def enter_pressed():
@@ -77,34 +106,58 @@ def main():
                 raise SystemExit("LeRobot writer 尚未监听 socket")
             time.sleep(0.1)
 
-    print("数据已就绪。按 Enter 开始录制；录制中再次按 Enter 停止。", flush=True)
-    if not args.auto_start:
-        input()
     stream = sock
-    period = 1.0 / args.fps
-    next_tick = time.monotonic()
-    sequence = -1
-    count = 0
-    last_frame_time = time.monotonic()
+    control_fd = command_reader(args.control_file)
+    set_state(args.state_file, "ready")
     try:
-        while count < args.timesteps and not rospy.is_shutdown():
-            if count and enter_pressed():
-                break
-            frame, new_sequence = source.get_newer_than(sequence)
-            if frame is not None:
-                send_packet(stream, frame)
-                sequence = new_sequence
-                count += 1
-                last_frame_time = time.monotonic()
-                print(f"\r已采集 {count}/{args.timesteps} 帧", end="", flush=True)
-            elif time.monotonic() - last_frame_time > args.stale_timeout:
-                raise RuntimeError("同步数据停止更新")
-            next_tick += period
-            delay = next_tick - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
+        first_episode = True
+        while not rospy.is_shutdown():
+            if first_episode and args.auto_start:
+                command = "start"
+            elif args.continuous:
+                set_state(args.state_file, "waiting")
+                print("等待下一条 episode（空格开始）", flush=True)
+                command = None
+                while command != "start" and not rospy.is_shutdown():
+                    command = next_command(control_fd, 0.2)
             else:
-                next_tick = time.monotonic()
+                print("数据已就绪。按 Enter 开始录制；录制中再次按 Enter 停止。", flush=True)
+                input()
+                command = "start"
+            if command != "start":
+                break
+            set_state(args.state_file, "recording")
+            period = 1.0 / args.fps
+            next_tick = time.monotonic()
+            sequence = -1
+            count = 0
+            last_frame_time = time.monotonic()
+            while count < args.timesteps and not rospy.is_shutdown():
+                command = next_command(control_fd, 0) if args.continuous else None
+                if (command == "stop" and count) or (count and enter_pressed()):
+                    break
+                frame, new_sequence = source.get_newer_than(sequence)
+                if frame is not None:
+                    send_packet(stream, frame)
+                    sequence = new_sequence
+                    count += 1
+                    last_frame_time = time.monotonic()
+                    print(f"\r已采集 {count}/{args.timesteps} 帧", end="", flush=True)
+                elif time.monotonic() - last_frame_time > args.stale_timeout:
+                    raise RuntimeError("同步数据停止更新")
+                next_tick += period
+                delay = next_tick - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_tick = time.monotonic()
+            send_packet(stream, {"_control": "episode_end"})
+            print(f"\n直接采集完成：{count} 帧", flush=True)
+            first_episode = False
+            if not args.continuous:
+                break
+        if args.continuous:
+            send_packet(stream, {"_control": "shutdown"})
     finally:
         try:
             try:
@@ -113,7 +166,9 @@ def main():
                 pass
         finally:
             stream.close()
-    print(f"\n直接采集完成：{count} 帧", flush=True)
+        if control_fd is not None:
+            os.close(control_fd)
+        set_state(args.state_file, "idle")
 
 
 if __name__ == "__main__":
