@@ -136,12 +136,15 @@ def main():
                 set_state(args.state_file, "waiting")
                 print("等待下一条 episode（空格开始）", flush=True)
                 command = None
-                while command != "start" and not rospy.is_shutdown():
+                while command not in ("start", "shutdown") and not rospy.is_shutdown():
                     command = next_command(control_fd, 0.2)
             else:
                 print("数据已就绪。按 Enter 开始录制；录制中再次按 Enter 停止。", flush=True)
                 input()
                 command = "start"
+            if command == "shutdown":
+                print("已请求结束采集会话，正在关闭写入器……", flush=True)
+                break
             if command != "start":
                 break
             set_state(args.state_file, "recording")
