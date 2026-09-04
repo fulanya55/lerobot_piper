@@ -59,6 +59,15 @@ def open_dataset(args, first):
         if dataset.num_episodes != args.episode_idx:
             raise RuntimeError(f"episode_idx={args.episode_idx}，下一个可写索引是 {dataset.num_episodes}")
         return dataset
+    # A failed first run can leave the dataset root behind before metadata is
+    # created.  LeRobotDataset.create() intentionally requires a fresh root,
+    # so remove only that known-empty residue and retry creation.  A non-empty
+    # partial dataset is left untouched and reported instead of overwriting it.
+    if root.exists():
+        entries = list(root.iterdir())
+        if entries:
+            raise RuntimeError(f"数据集目录已存在但缺少 meta/info.json，未覆盖：{root}")
+        root.rmdir()
     return LeRobotDataset.create(
         repo_id=args.repo_id, root=root, fps=args.fps, features=features_for(first["images"]),
         robot_type="bi_piper", use_videos=True, streaming_encoding=True,

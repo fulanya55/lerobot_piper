@@ -7,6 +7,7 @@ PIPER_WS="/home/agilex/cobot_magic/Piper_ros_private-ros-noetic"
 CAMERA_WS="/home/agilex/cobot_magic/camera_ws"
 CONDA_SH="/home/agilex/miniconda3/etc/profile.d/conda.sh"
 ALOHA_PYTHON="/home/agilex/miniconda3/envs/aloha/bin/python"
+UV_BIN="/home/agilex/miniconda3/envs/aloha/bin/uv"
 LEROBOT_DIR="$ROOT_DIR/lerobot_piper"
 DATASET_PATH="$ROOT_DIR/data/piper_lerobot_direct"
 REPO_ID="local/piper_dual_arm"
@@ -97,11 +98,14 @@ if [[ "$SERVICES_READY" != true ]]; then
   setsid bash -lc "$ROS_SETUP; exec $CAMERA_LAUNCH" >"$LOG_DIR/cameras.log" 2>&1 & PIDS+=("$!")
   setsid bash -lc "source '$CONDA_SH'; conda activate aloha; $ROS_SETUP; exec roslaunch piper start_ms_piper.launch mode:=0 auto_enable:=true" >"$LOG_DIR/arms.log" 2>&1 & PIDS+=("$!")
 fi
-setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache uv run --frozen --extra dataset python examples/piper/lerobot_stream_writer.py --socket '$SOCKET_PATH' --dataset-path '$DATASET_PATH' --repo-id '$REPO_ID' --task '$TASK' --episode-idx '$EPISODE_IDX' --fps '$FPS' --video-codec '$VIDEO_CODEC' --video-crf '$VIDEO_CRF'" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
+setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' run --frozen --extra dataset python examples/piper/lerobot_stream_writer.py --socket '$SOCKET_PATH' --dataset-path '$DATASET_PATH' --repo-id '$REPO_ID' --task '$TASK' --episode-idx '$EPISODE_IDX' --fps '$FPS' --video-codec '$VIDEO_CODEC' --video-crf '$VIDEO_CRF'" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
 for _ in $(seq 1 40); do [[ -S "$SOCKET_PATH" ]] && break; sleep .1; done
 echo "等待 ROS 话题……日志：$LOG_DIR"
 sleep 4
 STREAM_ARGS=(--socket "$SOCKET_PATH" --timesteps "$TIMESTEPS" --fps "$FPS" --sync-slop 0.10)
 [[ "$AUTO_START" == true ]] && STREAM_ARGS+=(--auto-start)
+set +u
+eval "$ROS_SETUP"
+set -u
 "$ALOHA_PYTHON" "$ROOT_DIR/lerobot_piper/script/ros_lerobot_stream.py" "${STREAM_ARGS[@]}"
 echo "采集完成，数据集已直接写入：$DATASET_PATH"
