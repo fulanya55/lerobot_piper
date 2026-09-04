@@ -11,6 +11,25 @@ PIDS=()
 cleanup(){ for p in "${PIDS[@]:-}"; do kill -TERM -- "-$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+# The USB adapters come back as can0 (left, USB 1-12) and can1 (right, USB
+# 1-13) after a reboot. Restore the names expected by the PiPER ROS launch
+# without requiring an interactive sudo prompt when the host allows ip-link
+# operations through sudoers.
+if ! ip link show can_left >/dev/null 2>&1 && ip link show can0 >/dev/null 2>&1; then
+  sudo -n ip link set can0 down && sudo -n ip link set can0 name can_left || true
+fi
+if ! ip link show can_right >/dev/null 2>&1 && ip link show can1 >/dev/null 2>&1; then
+  sudo -n ip link set can1 down && sudo -n ip link set can1 name can_right || true
+fi
+for can in can_left can_right; do
+  if ip link show "$can" >/dev/null 2>&1; then
+    sudo -n ip link set "$can" down || true
+    sudo -n ip link set "$can" type can bitrate 1000000 || true
+    sudo -n ip link set "$can" up || true
+    ip -details link show "$can" | grep -E '^[0-9]+:|bitrate' >>"$LOG_DIR/services.log" 2>&1 || true
+  fi
+done
+
 if ! bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1; then
   setsid bash -lc "$ROS_SETUP; exec roscore" >"$LOG_DIR/roscore.log" 2>&1 & PIDS+=("$!")
   for _ in $(seq 1 50); do bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1 && break; sleep .2; done
