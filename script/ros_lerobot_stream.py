@@ -53,22 +53,24 @@ def set_state(path, value):
 
 
 def command_reader(path):
+    return path
+
+
+def next_command(path, timeout=0.1):
     if not path:
         return None
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    return fd
-
-
-def next_command(fd, timeout=0.1):
-    if fd is None:
+    control = Path(path)
+    if not control.exists():
+        if timeout:
+            time.sleep(timeout)
         return None
-    readable, _, _ = select.select([fd], [], [], timeout)
-    if not readable:
-        return None
-    data = os.read(fd, 4096)
+    data = control.read_text(encoding="utf-8").strip()
     if not data:
+        if timeout:
+            time.sleep(timeout)
         return None
-    commands = data.decode(errors="replace").split()
+    control.write_text("", encoding="utf-8")
+    commands = data.split()
     return commands[-1] if commands else None
 
 
@@ -166,8 +168,6 @@ def main():
                 pass
         finally:
             stream.close()
-        if control_fd is not None:
-            os.close(control_fd)
         set_state(args.state_file, "idle")
 
 

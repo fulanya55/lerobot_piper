@@ -31,6 +31,8 @@ def features_for(images):
         "observation.state": dict(vector),
         "observation.velocity": dict(vector),
         "observation.effort": dict(vector),
+        # Keep the existing int64 feature schema, but store Unix seconds rather
+        # than nanoseconds so Arrow metadata statistics remain representable.
         "observation.timestamps_ns": {"dtype": "int64", "shape": (7,), "names": [f"topic_{i}" for i in range(7)]},
         "action": dict(vector),
     }
@@ -123,7 +125,7 @@ def main():
                 "observation.state": np.asarray(frame["qpos"], dtype=np.float32),
                 "observation.velocity": np.asarray(frame["qvel"], dtype=np.float32),
                 "observation.effort": np.asarray(frame["effort"], dtype=np.float32),
-                "observation.timestamps_ns": np.asarray(frame["timestamps_ns"], dtype=np.int64),
+                "observation.timestamps_ns": np.asarray(frame["timestamps_ns"], dtype=np.int64) // 1_000_000_000,
                 "action": np.asarray(frame["action"], dtype=np.float32),
                 "observation.images.cam_high": frame["images"][0],
                 "observation.images.cam_left_wrist": frame["images"][1],

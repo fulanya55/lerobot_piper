@@ -9,7 +9,7 @@ CONDA_SH="/home/agilex/miniconda3/etc/profile.d/conda.sh"
 ALOHA_PYTHON="/home/agilex/miniconda3/envs/aloha/bin/python"
 UV_BIN="/home/agilex/miniconda3/envs/aloha/bin/uv"
 LEROBOT_DIR="$ROOT_DIR/lerobot_piper"
-DATASET_PATH="$ROOT_DIR/data/piper_lerobot_direct"
+DATASET_PATH="$ROOT_DIR/data/piper_lerobot_direct_v2"
 REPO_ID="local/piper_dual_arm"
 TASK="dual-arm manipulation"
 EPISODE_IDX=0
@@ -81,7 +81,7 @@ LOG_DIR="$(mktemp -d /tmp/piper_direct_logs.XXXXXX)"
 if [[ "$CONTINUOUS" == true ]]; then
   CONTROL_FILE="${PIPER_CONTROL_FILE:-$(mktemp -u /tmp/piper_collect_control.XXXXXX)}"
   STATE_FILE="${CONTROL_FILE}.state"
-  [[ -p "$CONTROL_FILE" ]] || mkfifo "$CONTROL_FILE"
+  : > "$CONTROL_FILE"
 fi
 PIDS=()
 cleanup() {
@@ -112,7 +112,7 @@ setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' ru
 for _ in $(seq 1 40); do [[ -S "$SOCKET_PATH" ]] && break; sleep .1; done
 echo "等待 ROS 话题……日志：$LOG_DIR"
 sleep 4
-STREAM_ARGS=(--socket "$SOCKET_PATH" --timesteps "$TIMESTEPS" --fps "$FPS" --sync-slop 0.10)
+STREAM_ARGS=(--socket "$SOCKET_PATH" --timesteps "$TIMESTEPS" --fps "$FPS" --sync-slop 0.25 --wait-timeout 120)
 [[ "$AUTO_START" == true ]] && STREAM_ARGS+=(--auto-start)
 [[ "$CONTINUOUS" == true ]] && STREAM_ARGS+=(--continuous --control-file "$CONTROL_FILE" --state-file "$STATE_FILE")
 set +u
