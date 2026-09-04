@@ -85,6 +85,15 @@ def start_services():
     if services_proc is None or services_proc.poll() is not None:
         env=os.environ.copy(); env['PIPER_CAMERA_RESOLUTION']='960x540'; env['PIPER_SERVICE_LOG_DIR']=str(services_log)
         services_proc=subprocess.Popen([str(SERVICES)],env=env,start_new_session=True,stdout=(services_log/'services.log').open('a'),stderr=subprocess.STDOUT)
+    # A previous web session may have left a preview process alive on 8766.
+    # Replace it so stale ROS subscribers do not accumulate across retries.
+    for line in subprocess.run(['pgrep','-f',str(PREVIEW)], capture_output=True, text=True).stdout.splitlines():
+        try:
+            pid=int(line.strip()); os.killpg(pid, signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    preview_external = False
+    preview_proc = None
     if preview_proc is None or preview_proc.poll() is not None:
         try:
             with socket.create_connection(('127.0.0.1', 8766), timeout=0.3):

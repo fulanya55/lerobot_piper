@@ -11,6 +11,29 @@ PIDS=()
 cleanup(){ for p in "${PIDS[@]:-}"; do kill -TERM -- "-$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+# Previous web/retry sessions could leave orphaned roslaunch processes behind.
+# They publish the same JointState topics with different timestamps, which
+# makes ApproximateTimeSynchronizer unable to form a stable frame.  On every
+# service start, remove all old PiPER/camera launch groups and clean their
+# stale registrations before starting exactly one copy of each.
+stop_old_launches() {
+  local pattern pid pgid
+  for pattern in \
+    '/opt/ros/noetic/bin/roslaunch piper start_ms_piper.launch' \
+    '/opt/ros/noetic/bin/roslaunch /home/agilex/cobot_magic/xyx_piper_right/launch/three_cameras_60hz.launch' \
+    '/opt/ros/noetic/bin/roslaunch realsense2_camera multi_camera.launch'; do
+    while read -r pid; do
+      [[ -n "$pid" && "$pid" != "$$" ]] || continue
+      pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"
+      [[ -n "$pgid" ]] && kill -TERM -- "-$pgid" 2>/dev/null || true
+    done < <(pgrep -f "$pattern" || true)
+  done
+  sleep 1
+  printf 'y\n' | bash -lc "$ROS_SETUP; rosnode cleanup" >>"$LOG_DIR/services.log" 2>&1 || true
+}
+
+stop_old_launches
+
 # The USB adapters come back as can0 (left, USB 1-12) and can1 (right, USB
 # 1-13) after a reboot. Restore the names expected by the PiPER ROS launch
 # without requiring an interactive sudo prompt when the host allows ip-link
