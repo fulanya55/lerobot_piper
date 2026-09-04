@@ -89,6 +89,7 @@ def main():
     p.add_argument("--video-crf", type=int, default=23)
     p.add_argument("--encoder-threads", type=int, default=2)
     p.add_argument("--continuous", action="store_true")
+    p.add_argument("--episode-file")
     args = p.parse_args()
     path = Path(args.socket)
     path.unlink(missing_ok=True)
@@ -106,6 +107,8 @@ def main():
     if first is None:
         raise RuntimeError("未收到任何帧")
     dataset = open_dataset(args, first)
+    if args.episode_file:
+        Path(args.episode_file).write_text(str(dataset.num_episodes), encoding="utf-8")
     count = 0
     try:
         frame = first
@@ -115,6 +118,8 @@ def main():
                 if control == "episode_end":
                     if count:
                         dataset.save_episode(parallel_encoding=False)
+                        if args.episode_file:
+                            Path(args.episode_file).write_text(str(dataset.num_episodes), encoding="utf-8")
                         print(f"\n保存 episode frames={count}", flush=True)
                         count = 0
                     frame = recv_packet(stream)

@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--continuous", action="store_true")
     p.add_argument("--control-file")
     p.add_argument("--state-file")
+    p.add_argument("--episode-file")
+    p.add_argument("--episode-idx", type=int, default=0)
     p.add_argument("--img-front-topic", default="/camera_f/color/image_raw")
     p.add_argument("--img-left-topic", default="/camera_l/color/image_raw")
     p.add_argument("--img-right-topic", default="/camera_r/color/image_raw")
@@ -74,6 +76,19 @@ def next_command(path, timeout=0.1):
     return commands[-1] if commands else None
 
 
+def wait_for_saved_episode(path, expected_index):
+    if not path:
+        return
+    episode_file = Path(path)
+    while not rospy.is_shutdown():
+        try:
+            if int(episode_file.read_text(encoding="utf-8")) >= expected_index:
+                return
+        except (FileNotFoundError, ValueError):
+            pass
+        time.sleep(0.05)
+
+
 def enter_pressed():
     if not sys.stdin.isatty():
         return False
@@ -113,6 +128,7 @@ def main():
     set_state(args.state_file, "ready")
     try:
         first_episode = True
+        episode_index = args.episode_idx
         while not rospy.is_shutdown():
             if first_episode and args.auto_start:
                 command = "start"
@@ -158,7 +174,10 @@ def main():
                 else:
                     next_tick = time.monotonic()
             send_packet(stream, {"_control": "episode_end"})
-            print(f"\n直接采集完成：{count} 帧", flush=True)
+            set_state(args.state_file, "saving")
+            wait_for_saved_episode(args.episode_file, episode_index + 1)
+            print(f"\nepisode {episode_index} 已结束并保存：{count} 帧", flush=True)
+            episode_index += 1
             first_episode = False
             if not args.continuous:
                 break

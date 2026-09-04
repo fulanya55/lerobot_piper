@@ -81,13 +81,14 @@ LOG_DIR="$(mktemp -d /tmp/piper_direct_logs.XXXXXX)"
 if [[ "$CONTINUOUS" == true ]]; then
   CONTROL_FILE="${PIPER_CONTROL_FILE:-$(mktemp -u /tmp/piper_collect_control.XXXXXX)}"
   STATE_FILE="${CONTROL_FILE}.state"
+  EPISODE_FILE="${CONTROL_FILE}.episode"
   : > "$CONTROL_FILE"
 fi
 PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
   for pid in "${PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
-  rm -f "$SOCKET_PATH" "$CONTROL_FILE" "$STATE_FILE"
+  rm -f "$SOCKET_PATH" "$CONTROL_FILE" "$STATE_FILE" "$EPISODE_FILE"
 }
 trap cleanup EXIT INT TERM
 ROS_SETUP="source /opt/ros/noetic/setup.bash; source '$CAMERA_WS/devel/setup.bash'; source '$PIPER_WS/devel/setup.bash'"
@@ -108,13 +109,16 @@ if [[ "$SERVICES_READY" != true ]]; then
   setsid bash -lc "$ROS_SETUP; exec $CAMERA_LAUNCH" >"$LOG_DIR/cameras.log" 2>&1 & PIDS+=("$!")
   setsid bash -lc "source '$CONDA_SH'; conda activate aloha; $ROS_SETUP; exec roslaunch piper start_ms_piper.launch mode:=0 auto_enable:=true" >"$LOG_DIR/arms.log" 2>&1 & PIDS+=("$!")
 fi
-setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' run --frozen --extra dataset python examples/piper/lerobot_stream_writer.py --socket '$SOCKET_PATH' --dataset-path '$DATASET_PATH' --repo-id '$REPO_ID' --task '$TASK' --episode-idx '$EPISODE_IDX' --fps '$FPS' --video-codec '$VIDEO_CODEC' --video-crf '$VIDEO_CRF'" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
+WRITER_ARGS=(--socket "$SOCKET_PATH" --dataset-path "$DATASET_PATH" --repo-id "$REPO_ID" --task "$TASK" --episode-idx "$EPISODE_IDX" --fps "$FPS" --video-codec "$VIDEO_CODEC" --video-crf "$VIDEO_CRF")
+[[ "$CONTINUOUS" == true ]] && WRITER_ARGS+=(--continuous --episode-file "$EPISODE_FILE")
+WRITER_CMD="$(printf '%q ' "${WRITER_ARGS[@]}")"
+setsid bash -lc "cd '$LEROBOT_DIR'; UV_CACHE_DIR=/tmp/wxwu-uv-cache '$UV_BIN' run --frozen --extra dataset python examples/piper/lerobot_stream_writer.py $WRITER_CMD" >"$LOG_DIR/writer.log" 2>&1 & PIDS+=("$!")
 for _ in $(seq 1 40); do [[ -S "$SOCKET_PATH" ]] && break; sleep .1; done
 echo "等待 ROS 话题……日志：$LOG_DIR"
 sleep 4
 STREAM_ARGS=(--socket "$SOCKET_PATH" --timesteps "$TIMESTEPS" --fps "$FPS" --sync-slop 0.25 --wait-timeout 120)
 [[ "$AUTO_START" == true ]] && STREAM_ARGS+=(--auto-start)
-[[ "$CONTINUOUS" == true ]] && STREAM_ARGS+=(--continuous --control-file "$CONTROL_FILE" --state-file "$STATE_FILE")
+[[ "$CONTINUOUS" == true ]] && STREAM_ARGS+=(--continuous --control-file "$CONTROL_FILE" --state-file "$STATE_FILE" --episode-file "$EPISODE_FILE" --episode-idx "$EPISODE_IDX")
 set +u
 eval "$ROS_SETUP"
 set -u
