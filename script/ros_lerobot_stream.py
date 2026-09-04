@@ -150,9 +150,15 @@ def main():
             sequence = -1
             count = 0
             last_frame_time = time.monotonic()
+            shutdown_requested = False
             while count < args.timesteps and not rospy.is_shutdown():
                 command = next_command(control_fd, 0) if args.continuous else None
-                if (command == "stop" and count) or (count and enter_pressed()):
+                if command == "shutdown":
+                    shutdown_requested = True
+                    break
+                if command == "stop" and count:
+                    break
+                if count and enter_pressed():
                     break
                 frame, new_sequence = source.get_newer_than(sequence)
                 if frame is not None:
@@ -173,12 +179,16 @@ def main():
                     time.sleep(delay)
                 else:
                     next_tick = time.monotonic()
-            send_packet(stream, {"_control": "episode_end"})
-            set_state(args.state_file, "saving")
-            wait_for_saved_episode(args.episode_file, episode_index + 1)
-            print(f"\nepisode {episode_index} 已结束并保存：{count} 帧", flush=True)
-            episode_index += 1
-            first_episode = False
+            if count:
+                send_packet(stream, {"_control": "episode_end"})
+                set_state(args.state_file, "saving")
+                wait_for_saved_episode(args.episode_file, episode_index + 1)
+                print(f"\nepisode {episode_index} 已结束并保存：{count} 帧", flush=True)
+                episode_index += 1
+                first_episode = False
+            if shutdown_requested:
+                print("已请求结束采集会话，正在关闭写入器……", flush=True)
+                break
             if not args.continuous:
                 break
         if args.continuous:
