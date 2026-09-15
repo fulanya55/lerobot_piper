@@ -257,11 +257,36 @@ class BiPiper(Robot):
         interval = 1.0 / self.config.command_refresh_hz
         enable_interval = 1.0 / self.config.enable_keepalive_hz
         next_enable_refresh = time.monotonic()
+        last_enable_warning = 0.0
         while not self._command_refresh_stop.wait(interval):
             try:
                 with self._command_lock:
                     now = time.monotonic()
+                    # Never repeat a stale policy target while the controller
+                    # reports a lost enable.  A PiPER can become limp between
+                    # two policy frames; recovering only in the slower
+                    # watchdog leaves a short window in which gravity can drop
+                    # the arm.  The high-rate refresh loop owns this recovery
+                    # path and first re-enables at the measured pose.
+                    enable_lost, status = self._confirmed_enable_loss_locked()
+                    if enable_lost:
+                        if now - last_enable_warning >= 1.0:
+                            logger.warning(
+                                "PiPER enable status lost in command refresh; "
+                                "blocking policy targets and recovering at measured pose: %s",
+                                status,
+                            )
+                            last_enable_warning = now
+                        self._ensure_enabled_locked(hold_after=True)
+                        next_enable_refresh = now + enable_interval
+                        continue
+
                     if now >= next_enable_refresh:
+                        # Keep the controller's joint-enable state alive even
+                        # when no new policy action has arrived.  This is
+                        # intentionally owned by the same thread that sends
+                        # MOVE_J refreshes, so model loading/RPC stalls cannot
+                        # leave the arms limp.
                         for arm in self._arms.values():
                             arm.request_enable()
                         next_enable_refresh = now + enable_interval
@@ -269,9 +294,12 @@ class BiPiper(Robot):
                         target = self._command_target_physical.copy()
                         self._send_locked(target[:7], target[7:])
             except Exception as exc:
-                self._fatal_error = f"PiPER command refresh failed: {exc}"
-                logger.exception(self._fatal_error)
-                return
+                # Keep the CAN/enable owner alive through transient SDK status
+                # and bus errors.  The next cycle retries enable recovery; a
+                # hard disconnect is still surfaced by get_observation or
+                # send_action with the original SDK exception.
+                logger.exception("PiPER command refresh retryable error: %s", exc)
+                time.sleep(min(0.1, interval * 4.0))
 
     def _hold_current_locked(self) -> None:
         current = self._read_both()
@@ -308,17 +336,47 @@ class BiPiper(Robot):
                     if enable_lost:
                         logger.warning("PiPER enable lost; recovering at current pose")
                         self._ensure_enabled_locked(hold_after=True)
-                        if self.config.recover_enable_loss:
-                            continue
-                        self._fatal_error = (
-                            "PiPER motor enable was lost during inference. The arms were re-enabled at the "
-                            "measured pose; inspect the hardware and restart the client."
-                        )
-                        return
+                        # A recovered enable must not invalidate the whole
+                        # client.  The refresh loop has already discarded the
+                        # stale policy target; the next action is clipped from
+                        # the newly measured pose.
+                        continue
             except Exception as exc:
-                self._fatal_error = f"PiPER enable watchdog failed: {exc}"
-                logger.exception(self._fatal_error)
-                return
+                # Do not tear down CAN on a transient status/read failure.
+                # The watchdog and command refresh both retry while the client
+                # remains the sole owner of the interfaces.
+                logger.exception("PiPER enable watchdog retryable error: %s", exc)
+                time.sleep(min(0.1, interval * 4.0))
+
+    def _start_live_threads(self) -> None:
+        """Start enable recovery/command refresh as soon as CAN is enabled.
+
+        This must happen before waiting for ROS camera callbacks.  Camera
+        startup and policy-server handshakes can take seconds, while PiPER
+        firmware may drop joint enable after a short period without a command.
+        """
+        if self.config.dry_run:
+            return
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="bi-piper-enable-watchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+        self._command_refresh_stop.clear()
+        self._command_refresh_thread = threading.Thread(
+            target=self._command_refresh_loop, name="bi-piper-command-refresh", daemon=True
+        )
+        self._command_refresh_thread.start()
+
+    def _stop_live_threads(self) -> None:
+        self._command_refresh_stop.set()
+        if self._command_refresh_thread is not None:
+            self._command_refresh_thread.join(timeout=2.0)
+            self._command_refresh_thread = None
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=2.0)
+            self._watchdog_thread = None
 
     def _release_ros_handles(self) -> None:
         for handle in self._subscribers:
@@ -396,6 +454,13 @@ class BiPiper(Robot):
                 with self._command_lock:
                     self._ensure_enabled_locked(hold_after=True)
 
+            # Mark the hardware owner live and start the keepalive threads
+            # immediately.  Do this before waiting for camera callbacks: the
+            # first camera frame and the later policy-server model load must
+            # never be allowed to create an enable gap.
+            self._connected = True
+            self._start_live_threads()
+
             if self.config.camera_topics:
                 deadline = time.monotonic() + self.config.connect_timeout_s
                 while time.monotonic() < deadline:
@@ -407,19 +472,9 @@ class BiPiper(Robot):
                 else:
                     raise TimeoutError("Timed out waiting for the three ROS RealSense RGB streams")
 
-            self._connected = True
-            if not self.config.dry_run:
-                self._watchdog_stop.clear()
-                self._watchdog_thread = threading.Thread(
-                    target=self._watchdog_loop, name="bi-piper-enable-watchdog", daemon=True
-                )
-                self._watchdog_thread.start()
-                self._command_refresh_stop.clear()
-                self._command_refresh_thread = threading.Thread(
-                    target=self._command_refresh_loop, name="bi-piper-command-refresh", daemon=True
-                )
-                self._command_refresh_thread.start()
         except Exception:
+            self._stop_live_threads()
+            self._connected = False
             self._release_ros_handles()
             self._disconnect_arms()
             raise
@@ -590,14 +645,7 @@ class BiPiper(Robot):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self._command_refresh_stop.set()
-        if self._command_refresh_thread is not None:
-            self._command_refresh_thread.join(timeout=2.0)
-            self._command_refresh_thread = None
-        self._watchdog_stop.set()
-        if self._watchdog_thread is not None:
-            self._watchdog_thread.join(timeout=2.0)
-            self._watchdog_thread = None
+        self._stop_live_threads()
 
         try:
             with self._command_lock:

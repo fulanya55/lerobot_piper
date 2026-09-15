@@ -25,6 +25,7 @@ CONTINUOUS=false
 CONTROL_FILE=""
 STATE_FILE=""
 YES=false
+SKIP_SERVICE_AUTOSTART="${PIPER_SKIP_SERVICE_AUTOSTART:-false}"
 
 usage() {
   cat <<'EOF'
@@ -97,16 +98,27 @@ REQUIRED_TOPICS=(/camera_f/color/image_raw /camera_l/color/image_raw /camera_r/c
 existing_topics="$(bash -lc "$ROS_SETUP; rostopic list" 2>/dev/null || true)"
 SERVICES_READY=true
 for topic in "${REQUIRED_TOPICS[@]}"; do grep -Fxq "$topic" <<<"$existing_topics" || SERVICES_READY=false; done
+# A registered topic is not sufficient: a disconnected RealSense can leave
+# its name in the ROS graph while publishing zero frames.  Treat that as
+# unavailable so the collector does not enter a long synchronization timeout.
+if [[ "$SERVICES_READY" == true ]]; then
+  for topic in "${REQUIRED_TOPICS[@]}"; do
+    if ! bash -lc "$ROS_SETUP; exec timeout 4s rostopic echo -n 1 $topic >/dev/null 2>&1"; then
+      SERVICES_READY=false
+      echo "话题无实际消息，服务需重启：$topic" >&2
+    fi
+  done
+fi
 if [[ "$CAMERA_RES" == 960x540 ]]; then
   CAMERA_LAUNCH="roslaunch '$ROOT_DIR/../cobot_magic/xyx_piper_right/launch/three_cameras_60hz.launch'"
 else
   CAMERA_LAUNCH="roslaunch realsense2_camera multi_camera.launch"
 fi
-if [[ "$SERVICES_READY" != true ]] && ! bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1; then
+if [[ "$SKIP_SERVICE_AUTOSTART" != true && "$SERVICES_READY" != true ]] && ! bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1; then
   setsid bash -lc "$ROS_SETUP; exec roscore" >"$LOG_DIR/roscore.log" 2>&1 & PIDS+=("$!")
   for _ in $(seq 1 40); do bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1 && break; sleep .25; done
 fi
-if [[ "$SERVICES_READY" != true ]]; then
+if [[ "$SKIP_SERVICE_AUTOSTART" != true && "$SERVICES_READY" != true ]]; then
   setsid bash -lc "$ROS_SETUP; exec $CAMERA_LAUNCH" >"$LOG_DIR/cameras.log" 2>&1 & PIDS+=("$!")
   setsid bash -lc "source '$CONDA_SH'; conda activate aloha; $ROS_SETUP; exec roslaunch piper start_ms_piper.launch mode:=0 auto_enable:=true" >"$LOG_DIR/arms.log" 2>&1 & PIDS+=("$!")
 fi

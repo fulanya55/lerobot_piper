@@ -16,7 +16,7 @@ and refuses to start if it finds the old left/right PiPER nodes.
 The default checkpoint is:
 
 ```text
-/home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model
+/home/agilex/wxwu/model/pretrained_model
 ```
 
 The client reads `config.json` to select the policy and robot interface. When
@@ -40,6 +40,7 @@ Policy type is not hardcoded. The currently supported action interfaces are:
 
 | Checkpoint schema | Joint unit | Gripper unit | Deployment conversion |
 | --- | --- | --- | --- |
+| `joint_0..joint_13` (left 7D, then right 7D) | rad | m | direct |
 | `left_joint_1..6, left_gripper, ...` | rad | m | direct |
 | `left_arm_joint_1_rad..6, left_gripper_open_scale, ...` | rad | 0–1 open scale | scale to 0–0.08 m |
 | `left_arm_joint_1_rad..6, left_gripper_open, ...` | rad | 0–1 open scale | scale to 0–0.08 m |
@@ -53,8 +54,10 @@ The checkpoint path defaults to the current Pi0.5 deployment only as a
 convenience; changing `--checkpoint` selects the model type dynamically and
 requires an explicit dataset-appropriate `--task`.
 
-The current default Pi0.5 training dataset is 30 FPS. That checkpoint predicts a 50-action chunk and
-stores `n_action_steps=10`. Deployment defaults to 30 Hz and requests all 50
+The current default Pi0.5 training dataset is 30 FPS. Its action schema is the
+indexed 14D vector `joint_0..joint_13` (left 7D followed by right 7D). That
+checkpoint predicts a 50-action chunk and stores `n_action_steps=10`.
+Deployment defaults to 30 Hz and requests all 50
 predicted actions for the strict chunk-horizon baseline. `--actions-per-chunk
 10` is an explicit trial override: the model still predicts 50, while the
 server returns only the first 10.
@@ -72,6 +75,55 @@ This follows `/home/agilex/wxwu/PCD-LeRobot`: each arm uses
 `C_PiperInterface_V2`, `MotionCtrl_2(0x01, 0x01, ...)`, `JointCtrl`, and
 `GripperCtrl`. The deployment layer adds bounded enable timeout, measured-pose
 hold, per-step slew limits, and stale asynchronous-action invalidation.
+
+## Replay-style direct inference
+
+For direct synchronous control, without starting the gRPC policy server, use
+`run_direct_inference.sh`. It loads the local checkpoint, connects to the ROS
+camera topics and both CAN interfaces, then follows the same loop as
+`replay_episode.py`: read one observation, predict a chunk, and send each
+action at 30 Hz. This entrypoint intentionally does not ask for interactive
+`--confirm-enable` or `--confirm-live` flags.
+
+```bash
+cd /home/agilex/wxwu/lerobot_piper
+bash examples/piper/run_direct_inference.sh \
+  --checkpoint /home/agilex/wxwu/model/pretrained_model \
+  --dataset-info /home/agilex/wxwu/data/ATTACH_CAP_TO_PEN_1/meta/info.json \
+  --task "Pick up the pen cap and pen body, attach the cap to the body, then place the assembled pen into the pen holder."
+```
+
+Use `--max-policy-actions N` for a bounded rollout. After the rollout or the
+first `Ctrl+C`, the measured pose is held as in replay; press `Ctrl+C` again to
+close CAN. Stop the old PiPER ROS arm-control nodes first, but keep `roscore`
+and the RealSense launch running.
+
+## Separate policy server and robot client
+
+For a long-running deployment, keep the model server and the hardware client
+in separate terminals. The server owns only the GPU/checkpoint. The client
+connects CAN before the policy handshake and keeps both arms enabled and at a
+measured-pose hold while the server loads or briefly loses an RPC connection.
+The wrapper supplies the required acknowledgements non-interactively.
+
+Terminal 1:
+
+```bash
+cd /home/agilex/wxwu/lerobot_piper
+bash examples/piper/run_policy_server.sh
+```
+
+Terminal 2, after the server is listening:
+
+```bash
+cd /home/agilex/wxwu/lerobot_piper
+bash examples/piper/run_piper_client.sh
+```
+
+Keep both terminals alive. The client command has no action limit by default;
+set `PIPER_MAX_POLICY_ACTIONS=N` only for a bounded trial. A server restart
+does not intentionally close the client's CAN owner; restart the client only
+if the hardware itself reports a disconnected bus.
 
 ## Enable and stop behavior
 
@@ -159,7 +211,7 @@ bash examples/piper/run_pi05_inference.sh
 
 ```bash
 cd /home/agilex/wxwu/lerobot_piper
-uv run python examples/piper/policy_server.py \
+uv run --extra pi --extra async python examples/piper/policy_server.py \
   --host 127.0.0.1 \
   --port 18080 \
   --fps 30 \
@@ -181,11 +233,11 @@ Support both arms mechanically; this mode intentionally does not enable them:
 
 ```bash
 cd /home/agilex/wxwu/lerobot_piper
-uv run python examples/piper/async_policy_client.py \
+uv run --extra pi --extra async python examples/piper/async_policy_client.py \
   --mode observe \
-  --checkpoint /home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model \
-  --dataset-info /home/agilex/wxwu/data/PLACE_THE_TEST_TUBE/meta/info.json \
-  --task "Place the test tube on the test tube rack on the desk with the gripper." \
+  --checkpoint /home/agilex/wxwu/model/pretrained_model \
+  --dataset-info /home/agilex/wxwu/data/ATTACH_CAP_TO_PEN_1/meta/info.json \
+  --task "Pick up the pen cap and pen body, attach the cap to the body, then place the assembled pen into the pen holder." \
   --fps 30 \
   --actions-per-chunk 50
 ```
@@ -199,10 +251,10 @@ With an operator supporting each arm and the emergency stop reachable:
 
 ```bash
 cd /home/agilex/wxwu/lerobot_piper
-uv run python examples/piper/async_policy_client.py \
+uv run --extra pi --extra async python examples/piper/async_policy_client.py \
   --mode hold \
   --confirm-enable \
-  --checkpoint /home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model \
+  --checkpoint /home/agilex/wxwu/model/pretrained_model \
   --fps 30
 ```
 
@@ -221,12 +273,12 @@ enabled:
 
 ```bash
 cd /home/agilex/wxwu/lerobot_piper
-uv run python examples/piper/async_policy_client.py \
+uv run --extra pi --extra async python examples/piper/async_policy_client.py \
   --mode execute \
   --confirm-enable \
   --confirm-live \
-  --checkpoint /home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model \
-  --task "Place the test tube on the test tube rack on the desk with the gripper." \
+  --checkpoint /home/agilex/wxwu/model/pretrained_model \
+  --task "Pick up the pen cap and pen body, attach the cap to the body, then place the assembled pen into the pen holder." \
   --fps 30 \
   --actions-per-chunk 50 \
   --max-policy-actions 3 \
@@ -251,13 +303,13 @@ episode; the next `episode_idx` is read from `meta/info.json` automatically:
 
 ```bash
 cd /home/agilex/wxwu/lerobot_piper
-uv run --frozen python examples/piper/async_policy_client.py \
+uv run --frozen --extra pi --extra async python examples/piper/async_policy_client.py \
   --mode execute \
   --confirm-enable \
   --confirm-live \
-  --checkpoint /home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model \
-  --dataset-info /home/agilex/wxwu/data/PLACE_THE_TEST_TUBE/meta/info.json \
-  --task "Place the test tube on the test tube rack on the desk with the gripper." \
+  --checkpoint /home/agilex/wxwu/model/pretrained_model \
+  --dataset-info /home/agilex/wxwu/data/ATTACH_CAP_TO_PEN_1/meta/info.json \
+  --task "Pick up the pen cap and pen body, attach the cap to the body, then place the assembled pen into the pen holder." \
   --fps 30 \
   --actions-per-chunk 50 \
   --record-dataset-path /home/agilex/wxwu/data/PI05_INFERENCE_RECORDS
@@ -288,7 +340,7 @@ bash examples/piper/run_pi05_inference.sh \
   --confirm-enable \
   --confirm-live \
   --velocity 45 \
-  --dataset-info /home/agilex/wxwu/data/PLACE_THE_TEST_TUBE/meta/info.json \
+  --dataset-info /home/agilex/wxwu/data/ATTACH_CAP_TO_PEN_1/meta/info.json \
   --record-dataset-path /home/agilex/wxwu/data/MY_INFERENCE_DATA \
   --record-repo-id local/my_inference
 ```
@@ -303,7 +355,7 @@ smoothing disabled:
 | `--max-joint-step-rad` | `0.05` | Final measured-position joint step envelope |
 | `--max-gripper-step-m` | `0.005` | Final measured-position gripper step envelope |
 | `--trajectory-smoothing` | disabled | Opt in to velocity/acceleration trajectory limiting |
-| `--dataset-info` | `PLACE_THE_TEST_TUBE/meta/info.json` | FPS and 14D schema validation source |
+| `--dataset-info` | `ATTACH_CAP_TO_PEN_1/meta/info.json` | FPS and 14D schema validation source |
 | `--record-dataset-path` | unset | LeRobot v2.1 inference dataset destination |
 | `--record-repo-id` | `local/piper_inference` | Logical repo id stored by the converter |
 | `--record-episode-idx` | auto | Optional assertion for the next episode index |

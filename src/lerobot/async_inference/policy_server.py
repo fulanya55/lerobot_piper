@@ -310,7 +310,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+            # A malformed/failed inference must not kill the long-lived
+            # server. The client will retry its next observation and the local
+            # BiPiper owner keeps the arms enabled at the measured pose.
+            self.logger.exception(f"Error in StreamActions; keeping server alive: {e}")
 
             return services_pb2.Empty()
 

@@ -435,6 +435,18 @@ class RobotClient:
 
             except grpc.RpcError as e:
                 self.logger.error(f"Error receiving actions: {e}")
+                # Keep the client alive while the server restarts or a single
+                # RPC is interrupted.  The local BiPiper hold/enable threads
+                # remain active independently of the policy connection.
+                time.sleep(0.2)
+                while self.running:
+                    if self.start():
+                        self.logger.info("Policy server handshake restored")
+                        break
+                    self.logger.warning(
+                        "Policy server is still unavailable; retaining CAN/enable owner and retrying in 2s"
+                    )
+                    time.sleep(2.0)
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
@@ -620,28 +632,54 @@ class RobotClient:
             recording_observation = None
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
-                if frame_callback is not None:
-                    recording_observation = self.robot.get_observation()
-                    recording_timestamps = getattr(self.robot, "last_observation_timestamps_ns", None)
-                    if recording_timestamps is not None:
-                        recording_timestamps = dict(recording_timestamps)
-                self._queue_starved = False
-                _performed_action = self.control_loop_action(verbose)
-                performed_actions += 1
-                if frame_callback is not None:
-                    assert recording_observation is not None
-                    frame_callback(
-                        recording_observation,
-                        _performed_action,
-                        recording_timestamps,
-                        time.time_ns(),
+                try:
+                    if frame_callback is not None:
+                        recording_observation = self.robot.get_observation()
+                        recording_timestamps = getattr(self.robot, "last_observation_timestamps_ns", None)
+                        if recording_timestamps is not None:
+                            recording_timestamps = dict(recording_timestamps)
+                    self._queue_starved = False
+                    _performed_action = self.control_loop_action(verbose)
+                    performed_actions += 1
+                    if frame_callback is not None:
+                        assert recording_observation is not None
+                        frame_callback(
+                            recording_observation,
+                            _performed_action,
+                            recording_timestamps,
+                            time.time_ns(),
+                        )
+                    if max_actions is not None and performed_actions >= max_actions:
+                        self.logger.info(
+                            "Bounded policy trial complete after %d action(s); stopping before the next command",
+                            performed_actions,
+                        )
+                        break
+                except DeviceNotConnectedError as exc:
+                    # Keep RobotClient as the enable/CAN owner.  BiPiper's
+                    # watchdog has already recovered the measured pose (or is
+                    # doing so); do not disconnect and drop the arms merely
+                    # because one queued policy action became invalid.
+                    self.logger.exception(
+                        "Action command failed; holding measured pose and retrying policy stream: %s", exc
                     )
-                if max_actions is not None and performed_actions >= max_actions:
-                    self.logger.info(
-                        "Bounded policy trial complete after %d action(s); stopping before the next command",
-                        performed_actions,
+                    with self.action_queue_lock:
+                        while not self.action_queue.empty():
+                            self.action_queue.get_nowait()
+                    try:
+                        self.robot.hold_current()
+                    except Exception:
+                        self.logger.exception("Measured-pose hold retry failed")
+                    time.sleep(0.2)
+                except Exception as exc:
+                    self.logger.exception(
+                        "Unexpected action command failure; holding measured pose and retrying: %s", exc
                     )
-                    break
+                    try:
+                        self.robot.hold_current()
+                    except Exception:
+                        self.logger.exception("Measured-pose hold retry failed")
+                    time.sleep(0.2)
             elif performed_actions > 0 and not self._queue_starved:
                 self._queue_starved = True
                 self.logger.warning("Action queue starved after action #%d", self.latest_action)

@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 PIPER_WS="/home/agilex/cobot_magic/Piper_ros_private-ros-noetic"
 CAMERA_WS="/home/agilex/cobot_magic/camera_ws"
+LAUNCH_FILE="/home/agilex/cobot_magic/tmp/three_cameras_60hz.launch"
 CONDA_SH="/home/agilex/miniconda3/etc/profile.d/conda.sh"
 LOG_DIR="${PIPER_SERVICE_LOG_DIR:-/tmp/piper_robot_services}"
 mkdir -p "$LOG_DIR"
@@ -11,28 +12,10 @@ PIDS=()
 cleanup(){ for p in "${PIDS[@]:-}"; do kill -TERM -- "-$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# Previous web/retry sessions could leave orphaned roslaunch processes behind.
-# They publish the same JointState topics with different timestamps, which
-# makes ApproximateTimeSynchronizer unable to form a stable frame.  On every
-# service start, remove all old PiPER/camera launch groups and clean their
-# stale registrations before starting exactly one copy of each.
-stop_old_launches() {
-  local pattern pid pgid
-  for pattern in \
-    '/opt/ros/noetic/bin/roslaunch piper start_ms_piper.launch' \
-    '/opt/ros/noetic/bin/roslaunch /home/agilex/cobot_magic/xyx_piper_right/launch/three_cameras_60hz.launch' \
-    '/opt/ros/noetic/bin/roslaunch realsense2_camera multi_camera.launch'; do
-    while read -r pid; do
-      [[ -n "$pid" && "$pid" != "$$" ]] || continue
-      pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"
-      [[ -n "$pgid" ]] && kill -TERM -- "-$pgid" 2>/dev/null || true
-    done < <(pgrep -f "$pattern" || true)
-  done
-  sleep 1
-  printf 'y\n' | bash -lc "$ROS_SETUP; rosnode cleanup" >>"$LOG_DIR/services.log" 2>&1 || true
-}
-
-stop_old_launches
+# Cleanup is deliberately owned by run_collect_web.sh (and by the web retry
+# path).  This script only starts one fresh ROS session.  Mixing cleanup and
+# startup here previously allowed a broad pgrep match to terminate the new
+# parent process and made the web command return unexpectedly.
 
 # The USB adapters come back as can0 (left, USB 1-12) and can1 (right, USB
 # 1-13) after a reboot. Restore the names expected by the PiPER ROS launch
@@ -59,7 +42,7 @@ if ! bash -lc "$ROS_SETUP; rosnode list" >/dev/null 2>&1; then
 fi
 
 if [[ "${PIPER_CAMERA_RESOLUTION:-960x540}" == "960x540" ]]; then
-  CAMERA_CMD="roslaunch /home/agilex/cobot_magic/xyx_piper_right/launch/three_cameras_60hz.launch"
+  CAMERA_CMD="roslaunch '$LAUNCH_FILE'"
 else
   CAMERA_CMD="roslaunch realsense2_camera multi_camera.launch"
 fi

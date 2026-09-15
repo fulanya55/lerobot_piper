@@ -7,6 +7,7 @@ set -euo pipefail
 readonly REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly CAMERA_WS="/home/agilex/cobot_magic/camera_ws"
 readonly CAN_CONFIG="/home/agilex/cobot_magic/Piper_ros_private-ros-noetic/can_config.sh"
+readonly CAMERA_LAUNCH="${PIPER_CAMERA_LAUNCH:-/home/agilex/cobot_magic/tmp/three_cameras_60hz.launch}"
 readonly SERVER_HOST="${PIPER_SERVER_HOST:-127.0.0.1}"
 readonly SERVER_PORT="${PIPER_SERVER_PORT:-18080}"
 readonly FPS="${PIPER_FPS:-30}"
@@ -103,7 +104,12 @@ else
         echo "Stop the partial camera launch before retrying." >&2
         exit 1
     fi
-    roslaunch realsense2_camera multi_camera.launch >"$LOG_DIR/cameras.log" 2>&1 &
+    if [[ -f "$CAMERA_LAUNCH" ]]; then
+        roslaunch "$CAMERA_LAUNCH" >"$LOG_DIR/cameras.log" 2>&1 &
+    else
+        echo "Configured camera launch does not exist ($CAMERA_LAUNCH); falling back to realsense2_camera/multi_camera.launch"
+        roslaunch realsense2_camera multi_camera.launch >"$LOG_DIR/cameras.log" 2>&1 &
+    fi
     camera_pid=$!
     register_process "$camera_pid" cameras
     cameras_ready=false
@@ -133,7 +139,7 @@ if server_ready; then
 else
     (
         cd "$REPO_DIR"
-        exec uv run --frozen python examples/piper/policy_server.py \
+        exec uv run --frozen --extra pi --extra async python examples/piper/policy_server.py \
             --host "$SERVER_HOST" \
             --port "$SERVER_PORT" \
             --fps "$FPS" \

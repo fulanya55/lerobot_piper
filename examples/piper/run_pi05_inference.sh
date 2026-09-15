@@ -7,4 +7,4 @@ set -euo pipefail
 readonly REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 cd "$REPO_DIR"
-exec uv run --frozen python examples/piper/async_policy_client.py "$@"
+exec uv run --frozen --extra pi --extra async python examples/piper/async_policy_client.py "$@"

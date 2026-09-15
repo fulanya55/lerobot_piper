@@ -20,9 +20,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_CHECKPOINT = Path("/home/agilex/wxwu/model/PLATE_THE_TUBE_PI05_bs192/14k/pretrained_model")
-DEFAULT_DATASET_INFO = Path("/home/agilex/wxwu/data/PLACE_THE_TEST_TUBE/meta/info.json")
-DEFAULT_TASK = "Place the test tube on the test tube rack on the desk with the gripper."
+DEFAULT_CHECKPOINT = Path("/home/agilex/wxwu/model/pretrained_model")
+DEFAULT_DATASET_INFO = Path("/home/agilex/wxwu/data/ATTACH_CAP_TO_PEN_1/meta/info.json")
+DEFAULT_TASK = "Pick up the pen cap and pen body, attach the cap to the body, then place the assembled pen into the pen holder."
 DEFAULT_V21_CONVERTER = Path("/home/agilex/wxwu/lerobot_piper/script/hdf5_to_lerobot_v2.py")
 DEFAULT_V21_PYTHON = Path("/home/agilex/miniconda3/envs/lerobot/bin/python")
 METER_ACTION_NAMES = tuple(
@@ -30,6 +30,12 @@ METER_ACTION_NAMES = tuple(
     for side in ("left", "right")
     for name in ("joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper")
 )
+# The current checkpoint was trained from the v2.1 ATTACH_CAP_TO_PEN_1
+# dataset, whose 14D vector intentionally uses generic indexed names.  The
+# ordering is still the physical PiPER layout (left 7D followed by right 7D),
+# so it can be passed through BiPiper unchanged.  Keep this as an explicit
+# schema instead of guessing units from arbitrary feature names.
+INDEXED_ACTION_NAMES = tuple(f"joint_{index}" for index in range(14))
 LEGACY_SCALE_ACTION_NAMES = tuple(
     f"{side}_{name}"
     for side in ("left", "right")
@@ -47,6 +53,7 @@ LEGACY_OPEN_ACTION_NAMES = tuple(name.replace("_scale", "") for name in LEGACY_S
 EXPECTED_ACTION_NAMES = METER_ACTION_NAMES  # Backward-compatible import used by deployment tests.
 SUPPORTED_ACTION_SCHEMAS = {
     METER_ACTION_NAMES: "meters",
+    INDEXED_ACTION_NAMES: "meters",
     LEGACY_SCALE_ACTION_NAMES: "open_scale",
     LEGACY_OPEN_ACTION_NAMES: "open_scale",
 }
@@ -199,7 +206,9 @@ def load_checkpoint_contract(checkpoint: Path) -> CheckpointContract:
         prefix = "observation.images."
         if not source_key.startswith(prefix):
             raise ValueError(f"Unexpected camera source key: {source_key}")
-        camera_name = source_key.removeprefix(prefix)
+        # Keep the deployment entrypoint usable from the ROS/conda Python
+        # environment as well as LeRobot's Python 3.12 environment.
+        camera_name = source_key[len(prefix) :]
         if camera_name not in CAMERA_TOPICS:
             raise ValueError(f"No ROS topic is defined for checkpoint camera {camera_name!r}")
         camera_topics[camera_name] = CAMERA_TOPICS[camera_name]
@@ -254,6 +263,47 @@ def load_dataset_fps(dataset_info_path: Path, expected_action_names: tuple[str, 
     return fps
 
 
+def load_dataset_camera_shape(dataset_info_path: Path) -> tuple[int, int]:
+    """Return the recorded RGB camera ``(height, width)`` from dataset metadata.
+
+    The policy itself always resizes frames to 224x224, but the direct ROS
+    adapter validates the shape of incoming messages before exposing them to
+    LeRobot.  Reading the capture shape here keeps inference aligned with both
+    the current 960x540 launch and older 640x480 datasets.
+    """
+    dataset_info = _read_json(dataset_info_path.expanduser().resolve())
+    shapes: list[tuple[int, int]] = []
+    for key in (
+        "observation.images.cam_high",
+        "observation.images.cam_left_wrist",
+        "observation.images.cam_right_wrist",
+    ):
+        feature = dataset_info.get("features", {}).get(key)
+        if not isinstance(feature, dict):
+            raise ValueError(f"Dataset metadata is missing camera feature {key!r}")
+        shape = tuple(feature.get("shape") or ())
+        names = tuple(feature.get("names") or ())
+        if len(shape) != 3:
+            raise ValueError(f"Dataset camera {key!r} must have a 3D shape, found {shape}")
+        if names[:3] == ("channels", "height", "width"):
+            channels, height, width = shape
+        elif names[:3] == ("height", "width", "channels"):
+            height, width, channels = shape
+        elif shape[0] == 3:
+            channels, height, width = shape
+        elif shape[2] == 3:
+            height, width, channels = shape
+        else:
+            raise ValueError(f"Dataset camera {key!r} is not an RGB feature: shape={shape}, names={names}")
+        if channels != 3 or height <= 0 or width <= 0:
+            raise ValueError(f"Dataset camera {key!r} is not a valid RGB shape: {shape}")
+        shapes.append((int(height), int(width)))
+
+    if len(set(shapes)) != 1:
+        raise ValueError(f"Dataset cameras have inconsistent resolutions: {shapes}")
+    return shapes[0]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -277,6 +327,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional assertion; must equal the FPS read from --dataset-info.",
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=None,
+        help="Incoming ROS RGB height. Defaults to the first camera shape in --dataset-info (or 480).",
+    )
+    parser.add_argument(
+        "--camera-width",
+        type=int,
+        default=None,
+        help="Incoming ROS RGB width. Defaults to the first camera shape in --dataset-info (or 640).",
     )
     parser.add_argument(
         "--actions-per-chunk",
@@ -392,6 +454,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required for execute: acknowledges that postprocessed policy joint targets will move the arms.",
     )
+    parser.add_argument(
+        "--direct-live",
+        action="store_true",
+        help=(
+            "Run execute mode non-interactively. Intended for the dedicated run_piper_client.sh "
+            "deployment wrapper; equivalent to both live acknowledgements."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -406,11 +476,17 @@ def _validate_args(
     assert fps is not None
     if fps <= 0:
         raise SystemExit("--fps must be positive")
+    if args.camera_height is not None and args.camera_height <= 0:
+        raise SystemExit("--camera-height must be positive")
+    if args.camera_width is not None and args.camera_width <= 0:
+        raise SystemExit("--camera-width must be positive")
     if training_fps is not None and fps != training_fps:
         raise SystemExit(f"Refusing FPS mismatch: dataset metadata says {training_fps}, but --fps={fps}")
-    if args.mode in {"hold", "execute"} and not args.confirm_enable:
+    if args.direct_live and args.mode != "execute":
+        raise SystemExit("--direct-live is only supported in execute mode")
+    if args.mode in {"hold", "execute"} and not (args.confirm_enable or args.direct_live):
         raise SystemExit(f"Refusing {args.mode} mode without --confirm-enable")
-    if args.mode == "execute" and not args.confirm_live:
+    if args.mode == "execute" and not (args.confirm_live or args.direct_live):
         raise SystemExit("Refusing policy execution without --confirm-live")
     if args.max_policy_actions is not None and args.max_policy_actions <= 0:
         raise SystemExit("--max-policy-actions must be positive")
@@ -582,6 +658,12 @@ def main() -> None:
         else None
     )
     actions_per_chunk, fps = _validate_args(args, contract, training_fps)
+    if args.dataset_info is not None:
+        dataset_camera_height, dataset_camera_width = load_dataset_camera_shape(args.dataset_info)
+    else:
+        dataset_camera_height, dataset_camera_width = 480, 640
+    camera_height = args.camera_height or dataset_camera_height
+    camera_width = args.camera_width or dataset_camera_width
     recording_plan = _prepare_recording(args, fps=fps, task=task or "")
 
     print(
@@ -592,7 +674,8 @@ def main() -> None:
         f"training_dataset={contract.training_repo_id}, "
         f"train_config={'present' if contract.has_train_config else 'missing'}, "
         f"checkpoint_compile_model={contract.checkpoint_compile_model}, "
-        f"gripper_unit={contract.gripper_action_unit}",
+        f"gripper_unit={contract.gripper_action_unit}, "
+        f"camera={camera_width}x{camera_height}",
         flush=True,
     )
     if actions_per_chunk != contract.chunk_size:
@@ -626,11 +709,18 @@ def main() -> None:
         action_feature_names=contract.action_feature_names,
         gripper_action_unit=contract.gripper_action_unit,
         gripper_upper_m=args.gripper_range_m,
+        image_height=camera_height,
+        image_width=camera_width,
         velocity=args.velocity,
         max_joint_step_rad=args.max_joint_step_rad,
         max_gripper_step_m=args.max_gripper_step_m,
         trajectory_smoothing=args.trajectory_smoothing,
         policy_fps=fps,
+        # A transient enable loss is recovered in-place at the measured pose;
+        # do not poison the long-lived client with a fatal error or disconnect
+        # while the separate policy server continues to run.
+        recover_enable_loss=True,
+        enable_keepalive_hz=20.0,
         max_joint_velocity_rad_s=args.max_joint_velocity_rad_s,
         max_joint_acceleration_rad_s2=args.max_joint_acceleration_rad_s2,
         max_gripper_velocity_m_s=args.max_gripper_velocity_m_s,
@@ -692,9 +782,25 @@ def main() -> None:
         "(the first 16 GB checkpoint load can take several minutes)...",
         flush=True,
     )
-    if not client.start():
+    # Keep the robot/CAN owner alive while the separate policy server is
+    # loading or being restarted. BiPiper's command-refresh and enable-watchdog
+    # threads hold the measured pose during this handshake retry.
+    try:
+        while client.running:
+            if client.start():
+                break
+            print(
+                f"[PiPER client] Policy server {args.server_address} is unavailable; "
+                "CAN remains connected and both arms stay enabled. Retrying in 2s...",
+                flush=True,
+            )
+            time.sleep(2.0)
+        else:
+            client.stop()
+            raise RuntimeError("Client stopped before policy server became available")
+    except KeyboardInterrupt:
         client.stop()
-        raise RuntimeError(f"Unable to connect to policy server at {args.server_address}")
+        raise
     print("[PiPER client] Policy ready. Starting inference loop.", flush=True)
 
     recorder = None
@@ -744,7 +850,18 @@ def main() -> None:
             stop_event=stop_event if recorder is not None else None,
         )
     except KeyboardInterrupt:
-        pass
+        client.shutdown_event.set()
+        print(
+            "[PiPER client] Policy control stopped. Measured-pose hold is active; "
+            "press Ctrl+C again to close CAN and exit.",
+            flush=True,
+        )
+        try:
+            while True:
+                client.robot.hold_current()
+                time.sleep(1.0 / client.robot.config.command_refresh_hz)
+        except KeyboardInterrupt:
+            print("[PiPER client] Final interrupt received; closing CAN.", flush=True)
     finally:
         stop_event.set()
         try:
