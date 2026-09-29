@@ -108,7 +108,7 @@ def test_async_inference_e2e(monkeypatch):
     policy_server.policy_type = "act"
 
     def _fake_get_action_chunk(_self, _obs, _type="test"):
-        action_dim = 6
+        action_dim = len(mock_robot.action_features)
         batch_size = 1
         actions_per_chunk = policy_server.actions_per_chunk
 

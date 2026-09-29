@@ -1,0 +1,6 @@
+[Match]
+Property=ID_SERIAL_SHORT=002100355631511920313857
+OriginalName=can*
+
+[Link]
+Name=can_left

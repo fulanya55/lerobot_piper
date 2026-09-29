@@ -1,0 +1,6 @@
+[Match]
+Property=ID_SERIAL_SHORT=002800175746570A20383839
+OriginalName=can*
+
+[Link]
+Name=can_right

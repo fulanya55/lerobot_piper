@@ -37,6 +37,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
@@ -86,6 +87,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self.observation_rename_map: dict[str, str] = {}
+        self._loaded_policy_key: tuple[str, str, str, tuple[tuple[str, str], ...]] | None = None
+        self._policy_load_lock = threading.Lock()
 
     @property
     def running(self):
@@ -142,11 +146,47 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
+        policy_key = (
+            policy_specs.policy_type,
+            str(policy_specs.pretrained_name_or_path),
+            policy_specs.device,
+            tuple(sorted(policy_specs.rename_map.items())),
+        )
+
+        with self._policy_load_lock:
+            if self.policy is not None and self._loaded_policy_key == policy_key:
+                self.logger.info("Reusing already loaded policy for %s", policy_specs.pretrained_name_or_path)
+                return services_pb2.Empty()
+
+            self.logger.info(
+                "Loading policy %s onto %s; large checkpoints may take several minutes on first use",
+                policy_specs.pretrained_name_or_path,
+                self.device,
+            )
+            self._load_policy(policy_specs, policy_key)
+
+        return services_pb2.Empty()
+
+    def _load_policy(self, policy_specs, policy_key) -> None:
+        """Load one policy while ``_policy_load_lock`` prevents duplicate concurrent loads."""
+
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
+        policy_config = PreTrainedConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+        checkpoint_compile_model = getattr(policy_config, "compile_model", None)
+        if self.config.compile_model is not None and hasattr(policy_config, "compile_model"):
+            policy_config.compile_model = self.config.compile_model
+            self.logger.info(
+                "torch.compile override: checkpoint=%s, effective=%s",
+                checkpoint_compile_model,
+                policy_config.compile_model,
+            )
+        policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            config=policy_config,
+        )
+        policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -155,18 +195,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # explicitly supplies a deployment-time override.
         if policy_specs.rename_map:
             preprocessor_overrides["rename_observations_processor"] = {"rename_map": policy_specs.rename_map}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
             preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
+        observation_rename_map = next(
+            (dict(step.rename_map) for step in preprocessor.steps if hasattr(step, "rename_map")),
+            {},
+        )
+
+        # Publish the new policy as one coherent cache entry only after every
+        # loading step succeeds. A failed replacement cannot corrupt a working
+        # cached policy.
+        self.policy = policy
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+        self.observation_rename_map = observation_rename_map
+        self._loaded_policy_key = policy_key
 
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
-
-        return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
@@ -259,7 +310,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+            # A malformed/failed inference must not kill the long-lived
+            # server. The client will retry its next observation and the local
+            # BiPiper owner keeps the arms enabled at the measured pose.
+            self.logger.exception(f"Error in StreamActions; keeping server alive: {e}")
 
             return services_pb2.Empty()
 
@@ -341,6 +395,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            observation_rename_map=self.observation_rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 
