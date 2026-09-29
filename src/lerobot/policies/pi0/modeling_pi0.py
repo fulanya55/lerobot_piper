@@ -55,6 +55,7 @@ from lerobot.utils.constants import (
 )
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
+from ..common.preference import compute_flow_matching_grpo, compute_flow_matching_rpro
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -589,7 +590,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise, time) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise,
+        time,
+        *,
+        return_behavior_features: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -638,7 +651,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        if return_behavior_features:
+            return losses, suffix_out
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1091,7 +1107,15 @@ class PI0Policy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        reduction: str = "mean",
+        *,
+        flow_noise: Tensor | None = None,
+        flow_time: Tensor | None = None,
+        return_flow_targets: bool = False,
+    ) -> tuple[Tensor, dict] | tuple[Tensor, dict, dict[str, Tensor]]:
         """Run the batch through the model and compute the loss for training.
 
         Args:
@@ -1100,14 +1124,30 @@ class PI0Policy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"reduction must be 'mean' or 'none', got {reduction!r}")
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
-        noise = self.model.sample_noise(actions.shape, actions.device)
-        time = self.model.sample_time(actions.shape[0], actions.device)
+        noise = self.model.sample_noise(actions.shape, actions.device) if flow_noise is None else flow_noise
+        time = self.model.sample_time(actions.shape[0], actions.device) if flow_time is None else flow_time
+        noise = noise.detach().to(device=actions.device, dtype=actions.dtype)
+        time = time.detach().to(device=actions.device, dtype=actions.dtype)
+        if noise.shape != actions.shape:
+            raise ValueError(
+                f"flow_noise shape {tuple(noise.shape)} must match actions {tuple(actions.shape)}"
+            )
+        if time.shape != (actions.shape[0],):
+            raise ValueError(f"flow_time must have shape ({actions.shape[0]},), got {tuple(time.shape)}")
+        if flow_noise is not None and not torch.isfinite(noise).all():
+            raise ValueError("flow_noise must be finite")
+        if flow_time is not None and not torch.isfinite(time).all():
+            raise ValueError("flow_time must be finite")
+        if flow_time is not None and ((time < 0).any() or (time > 1).any()):
+            raise ValueError("flow_time values must be in [0, 1]")
 
         # Compute loss
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
@@ -1124,12 +1164,108 @@ class PI0Policy(PreTrainedPolicy):
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            output = per_sample_loss
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            output = losses.mean()
+            loss_dict["loss"] = output.item()
+        if return_flow_targets:
+            return output, loss_dict, {"noise": noise.detach(), "time": time.detach()}
+        return output, loss_dict
+
+    def compute_rpro_loss(
+        self,
+        winner_batch: dict[str, Tensor],
+        loser_batch: dict[str, Tensor],
+        *,
+        reference_policy: "PI0Policy",
+        beta: float,
+        lambda_pro: float = 1.0,
+        lambda_sft: float = 1.0,
+        pair_weight: Tensor | None = None,
+        success_sft_batch: dict[str, Tensor] | None = None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Compute one PI0 FlowPRO/RPRO update with a frozen PI0 reference."""
+
+        return compute_flow_matching_rpro(
+            self,
+            winner_batch,
+            loser_batch,
+            reference_policy=reference_policy,
+            beta=beta,
+            lambda_pro=lambda_pro,
+            lambda_sft=lambda_sft,
+            pair_weight=pair_weight,
+            success_sft_batch=success_sft_batch,
+        )
+
+    def compute_grpo_loss(
+        self,
+        rollout_batch: dict[str, Tensor],
+        *,
+        reference_policy: "PI0Policy",
+        advantages: Tensor,
+        beta: float = 0.1,
+        clip_range: float = 0.2,
+        kl_coef: float = 0.02,
+        lambda_grpo: float = 1.0,
+        lambda_sft: float = 0.0,
+        success_sft_batch: dict[str, Tensor] | None = None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Compute the grouped dense-reward GRPO objective for PI0."""
+
+        return compute_flow_matching_grpo(
+            self,
+            rollout_batch,
+            reference_policy=reference_policy,
+            advantages=advantages,
+            beta=beta,
+            clip_range=clip_range,
+            kl_coef=kl_coef,
+            lambda_grpo=lambda_grpo,
+            lambda_sft=lambda_sft,
+            success_sft_batch=success_sft_batch,
+        )
+
+    def extract_behavior_features(
+        self, batch: dict[str, Tensor], *, enable_grad: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """Extract completed action-expert tokens at flow time zero."""
+
+        was_training = self.training
+        self.train(enable_grad)
+        try:
+            context = torch.enable_grad() if enable_grad else torch.no_grad()
+            with context:
+                images, img_masks = self._preprocess_images(batch)
+                lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+                lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+                state = self.prepare_state(batch)
+                actions = self.prepare_action(batch)
+                _, features = self.model.forward(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    actions,
+                    torch.zeros_like(actions),
+                    torch.zeros(actions.shape[0], device=actions.device, dtype=actions.dtype),
+                    return_behavior_features=True,
+                )
+                action_is_pad = batch.get("action_is_pad")
+                if action_is_pad is None:
+                    valid_mask = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
+                else:
+                    if action_is_pad.shape != features.shape[:2]:
+                        raise ValueError(
+                            f"action_is_pad shape {tuple(action_is_pad.shape)} must match "
+                            f"behavior tokens {tuple(features.shape[:2])}"
+                        )
+                    valid_mask = ~action_is_pad.to(device=features.device, dtype=torch.bool)
+                return features.float(), valid_mask
+        finally:
+            self.train(was_training)
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0 fine-tuning."""

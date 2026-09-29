@@ -1,13 +1,20 @@
-# Full-parameter fine-tuning of LeRobot pi0.5 on the cleaned pen-cap dataset.
+# Full-parameter fine-tuning of LeRobot pi0.5 on the Galbot G1 bread-from-
+# microwave demonstrations, using three cameras: head-left, left wrist,
+# and right wrist.
 #
-# Dataset size: 168,740 frames.
+# Dataset size: 73,826 frames / 100 episodes.
 # 8 GPUs x batch_size 4 x 6 gradient-accumulation steps = 192 samples/update.
-# Five epochs require 26,370 micro-steps (rounded to a complete GA cycle).
+# Five epochs require 11,536 micro-steps, rounded to 11,538 so the final
+# accumulated gradients are applied (1,923 optimizer updates).
+#
+# The source exposes 38 state/action dimensions. The launch script creates a
+# local 23D projection by dropping all chassis position/velocity and odometry fields,
+# actions are padded to 32D internally, preserving checkpoint compatibility.
 
 dataset:
-  repo_id: ATTACH_CAP_TO_PEN_1_1
+  repo_id: Galbot_G1_take_bread_from_microwave_0909_2720_pi05_23d_3cam
   repo_type: dataset
-  root: /root/wxwu/dataset/0907/ATTACH_CAP_TO_PEN_1_1
+  root: /root/wxwu/dataset/Galbot_G1_take_bread_from_microwave_0909_2720_pi05_23d_3cam
   episodes: null
   exclude_episodes: null
   max_episodes_per_dataset: null
@@ -20,40 +27,9 @@ dataset:
     enable: false
     max_num_transforms: 3
     random_order: false
-    tfs:
-      brightness:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          brightness: [0.8, 1.2]
-      contrast:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          contrast: [0.8, 1.2]
-      saturation:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          saturation: [0.5, 1.5]
-      hue:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          hue: [-0.05, 0.05]
-      sharpness:
-        weight: 1.0
-        type: SharpnessJitter
-        kwargs:
-          sharpness: [0.5, 1.5]
-      affine:
-        weight: 1.0
-        type: RandomAffine
-        kwargs:
-          degrees: [-5.0, 5.0]
-          translate: [0.05, 0.05]
+    tfs: {}
   revision: null
-  use_imagenet_stats: true
+  use_imagenet_stats: false
   video_backend: torchcodec
   return_uint8: true
   depth_output_unit: mm
@@ -72,22 +48,22 @@ policy:
     STATE: QUANTILES
     ACTION: QUANTILES
   input_features:
-    observation.images.base_0_rgb:
+    observation.images.head_left_rgb:
       type: VISUAL
       shape: [3, 224, 224]
-    observation.images.left_wrist_0_rgb:
+    observation.images.left_wrist_rgb:
       type: VISUAL
       shape: [3, 224, 224]
-    observation.images.right_wrist_0_rgb:
+    observation.images.right_wrist_rgb:
       type: VISUAL
       shape: [3, 224, 224]
     observation.state:
       type: STATE
-      shape: [32]
+      shape: [23]
   output_features:
     action:
       type: ACTION
-      shape: [32]
+      shape: [23]
   device: cuda
   use_amp: false
   use_peft: false
@@ -117,12 +93,10 @@ policy:
     - gripper
   action_feature_names: null
   rtc_config: null
-  # Explicit leaf-module FSDP wrapping is incompatible with pi0.5's internal
-  # checkpoint recomputation (Tensor/DTensor mixing during backward).
+  # Match the previous Galbot bread training run. This keeps activations resident
+  # and reproduces its memory/performance profile.
   gradient_checkpointing: false
   compile_model: true
-  # Autotune kernels without CUDA graphs: safer with FSDP all-gathers and uses
-  # less persistent GPU memory than max-autotune/reduce-overhead cudagraph modes.
   compile_mode: max-autotune-no-cudagraphs
   freeze_vision_encoder: false
   train_expert_only: false
@@ -131,17 +105,14 @@ policy:
   optimizer_eps: 1.0e-8
   optimizer_weight_decay: 0.01
   optimizer_grad_clip_norm: 1.0
-  # Keep the official pi0.5 scheduler preset. LeRobot builds this scheduler in
-  # cfg.steps (micro-step) coordinates; auto-scaling yields 791 warmup steps
-  # (3% of the 26,370-step run) while retaining the 30,000-step decay preset.
-  scheduler_warmup_steps: 900
-  scheduler_decay_steps: 30000
+  scheduler_warmup_steps: 347
+  scheduler_decay_steps: 11538
   scheduler_decay_lr: 2.5e-6
   tokenizer_max_length: 200
 
 reward_model: null
-output_dir: /root/wxwu/lerobot_piper/outputs/train/piper_pi05_cap0907_bs4_ga6_ep5
-job_name: piper_pi05_cap0907_bs4_ga6_ep5
+output_dir: /root/wxwu/lerobot_piper/outputs/train/piper_pi05_galbot_g1_bread_bs4_ga6_ep5_3cam
+job_name: piper_pi05_galbot_g1_bread_bs4_ga6_ep5_3cam
 resume: false
 seed: 42
 cudnn_deterministic: false
@@ -150,20 +121,18 @@ batch_size: 4
 prefetch_factor: 2
 persistent_workers: true
 dataloader_multiprocessing_context: spawn
-steps: 26370
+steps: 11538
 env_eval_freq: 0
 log_freq: 6
 eval_steps: 0
 max_eval_samples: 0
 tolerance_s: 0.0001
 save_checkpoint: true
-# Roughly every two epochs, aligned to GA=6. A final checkpoint is always written.
-save_freq: 8790
+# Save only the final checkpoint to avoid post-save FSDP allocator fragmentation.
+save_freq: 0
 checkpoint_format: safetensors
 use_policy_training_preset: true
 
-# validate() replaces these with the identical pi0.5 policy presets because
-# use_policy_training_preset=true. They remain explicit so this is a complete config.
 optimizer:
   type: adamw
   lr: 2.5e-5
@@ -174,8 +143,8 @@ optimizer:
 
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 900
-  num_decay_steps: 30000
+  num_warmup_steps: 347
+  num_decay_steps: 11538
   peak_lr: 2.5e-5
   decay_lr: 2.5e-6
 
@@ -193,8 +162,6 @@ accelerator:
     steps: 6
   fsdp:
     reshard_after_forward: true
-    # Proven pi0.5/FSDP2 setup from the earlier Piper run: shard leaf modules
-    # and never let the size-based policy select a ModuleList container.
     wrap_modules: [Linear, Embedding, Conv2d]
     min_num_params: null
     cpu_offload: false
@@ -231,11 +198,10 @@ ema:
 
 wandb:
   enable: true
-  # Full pi0.5 checkpoints are very large; metrics/config still sync online.
   disable_artifact: true
   project: lerobot-piper
   entity: null
-  notes: Full-parameter pi0.5 fine-tuning on cleaned pen-cap success demonstrations; 8 GPUs x batch=4 x GA6, warmup=3%, epochs=5.
+  notes: Full-parameter pi0.5 fine-tuning on Galbot G1 bread-from-microwave demonstrations; 3 cameras (head-left + both wrists), 8 GPUs x batch=4 x GA6, 5 epochs, 23D action/state (source 38D, chassis fields dropped).
   run_id: null
   mode: online
   add_tags: true
@@ -245,9 +211,9 @@ save_checkpoint_to_hub: false
 sample_weighting: null
 
 rename_map:
-  observation.images.cam_high: observation.images.base_0_rgb
-  observation.images.cam_left_wrist: observation.images.left_wrist_0_rgb
-  observation.images.cam_right_wrist: observation.images.right_wrist_0_rgb
+  observation.images.image_head_left: observation.images.head_left_rgb
+  observation.images.image_arm_right: observation.images.right_wrist_rgb
+  observation.images.image_arm_left: observation.images.left_wrist_rgb
 
 job:
   target: null

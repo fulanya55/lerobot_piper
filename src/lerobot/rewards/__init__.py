@@ -13,6 +13,9 @@
 # limitations under the License.
 
 from .classifier.configuration_classifier import RewardClassifierConfig as RewardClassifierConfig
+from .eeg_assisted_scorer.configuration_eeg_assisted_scorer import (
+    EEGAssistedScorerConfig as EEGAssistedScorerConfig,
+)
 from .factory import (
     get_reward_model_class as get_reward_model_class,
     make_reward_model as make_reward_model,
@@ -27,6 +30,7 @@ from .topreward.configuration_topreward import TOPRewardConfig as TOPRewardConfi
 __all__ = [
     # Configuration classes
     "RewardClassifierConfig",
+    "EEGAssistedScorerConfig",
     "RobometerConfig",
     "SARMConfig",
     "TOPRewardConfig",

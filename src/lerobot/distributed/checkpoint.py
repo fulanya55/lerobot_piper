@@ -27,6 +27,7 @@ Two artifact channels with distinct owners:
 Every function that touches sharded state is a collective and must run on ALL ranks.
 """
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -161,14 +162,45 @@ def load_sharded_optimizer(
         model (nn.Module): The prepared (sharded) model the optimizer state is keyed by.
         input_dir (Path): The directory containing the `optimizer_0/` shard subdirectory.
     """
-    from accelerate.utils import load_fsdp_optimizer
     from accelerate.utils.constants import OPTIMIZER_NAME
+    import torch.distributed.checkpoint as dist_cp
+    from accelerate.utils.fsdp_utils import _prepare_sd_options
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
 
     # Exact shard directory for the same reason as load_sharded_model: accelerate's substring
     # check ("optimizer" in the path) would misread e.g. --job_name=optimizer_sweep run paths.
-    load_fsdp_optimizer(
-        _fsdp_plugin(accelerator), accelerator, optimizer, model, str(input_dir / f"{OPTIMIZER_NAME}_0")
+    optimizer_dir = input_dir / f"{OPTIMIZER_NAME}_0"
+    # torch.distributed.checkpoint initializes Adam state for every parameter before loading.
+    # Older checkpoints can legitimately omit state for parameters that never received a
+    # gradient (for PI05 this is the unused language-model lm_head). Filter those entries before
+    # planning the load, while retaining all matching states and parameter-group settings.
+    sd_options = _prepare_sd_options(_fsdp_plugin(accelerator))
+    optimizer_state = get_optimizer_state_dict(model, optimizer, options=sd_options)
+    metadata = dist_cp.FileSystemReader(str(optimizer_dir)).read_metadata()
+    available_keys = set(metadata.state_dict_metadata)
+    state = optimizer_state.get("state", {})
+    omitted = []
+    for fqn in list(state):
+        prefix = f"optimizer.state.model.{fqn}."
+        if not any(key.startswith(prefix) for key in available_keys):
+            state.pop(fqn)
+            omitted.append(fqn)
+
+    if omitted:
+        logging.warning(
+            "Optimizer checkpoint omits state for %d parameter(s); leaving them freshly initialized.",
+            len(omitted),
+        )
+    dist_cp.load(
+        state_dict={"optimizer": optimizer_state},
+        storage_reader=dist_cp.FileSystemReader(str(optimizer_dir)),
+        planner=DefaultLoadPlanner(),
     )
+    set_optimizer_state_dict(model, optimizer, optimizer_state, options=sd_options)
 
 
 def dcp_to_safetensors(dcp_dir: Path, output_dir: Path, *, delete_dcp: bool = False) -> Path:

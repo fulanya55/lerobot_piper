@@ -23,6 +23,7 @@ require_package("av", extra="dataset")
 from .aggregate import aggregate_datasets
 from .compute_stats import DEFAULT_QUANTILES, aggregate_stats, get_feature_stats
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
+from .eeg_rlhf import EEGChunkWindowDataset, EEGPreferencePairDataset, EEGWindowConfig
 from .dataset_tools import (
     add_features,
     convert_image_to_video_dataset,
@@ -65,6 +66,9 @@ __all__ = [
     "DEFAULT_QUANTILES",
     "EVENT_ONLY_STYLES",
     "EpisodeAwareSampler",
+    "EEGChunkWindowDataset",
+    "EEGPreferencePairDataset",
+    "EEGWindowConfig",
     "LANGUAGE_EVENTS",
     "LANGUAGE_PERSISTENT",
     "LeRobotDataset",

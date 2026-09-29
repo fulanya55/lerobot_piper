@@ -1,13 +1,13 @@
-# Full-parameter fine-tuning of LeRobot pi0.5 on the cleaned pen-cap dataset.
-#
-# Dataset size: 168,740 frames.
-# 8 GPUs x batch_size 4 x 6 gradient-accumulation steps = 192 samples/update.
-# Five epochs require 26,370 micro-steps (rounded to a complete GA cycle).
+# Full-parameter PI0.5 fine-tuning on all cleaned successful
+# place-test-tube demonstrations. 8 GPUs x batch=8 x GA6.
+# 158,863 frames x 4 epochs -> 9,936 micro-steps (rounded to a complete
+# gradient-accumulation cycle). This keeps the original formal optimizer and
+# scheduler while increasing the per-GPU batch from 4 to 8.
 
 dataset:
-  repo_id: ATTACH_CAP_TO_PEN_1_1
+  repo_id: PLACE_THE_TEST_TUBE_MERGED
   repo_type: dataset
-  root: /root/wxwu/dataset/0907/ATTACH_CAP_TO_PEN_1_1
+  root: /root/wxwu/dataset/PLACE_THE_TEST_TUBE_NEW/PLACE_THE_TEST_TUBE_MERGED
   episodes: null
   exclude_episodes: null
   max_episodes_per_dataset: null
@@ -20,40 +20,9 @@ dataset:
     enable: false
     max_num_transforms: 3
     random_order: false
-    tfs:
-      brightness:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          brightness: [0.8, 1.2]
-      contrast:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          contrast: [0.8, 1.2]
-      saturation:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          saturation: [0.5, 1.5]
-      hue:
-        weight: 1.0
-        type: ColorJitter
-        kwargs:
-          hue: [-0.05, 0.05]
-      sharpness:
-        weight: 1.0
-        type: SharpnessJitter
-        kwargs:
-          sharpness: [0.5, 1.5]
-      affine:
-        weight: 1.0
-        type: RandomAffine
-        kwargs:
-          degrees: [-5.0, 5.0]
-          translate: [0.05, 0.05]
+    tfs: {}
   revision: null
-  use_imagenet_stats: true
+  use_imagenet_stats: false
   video_backend: torchcodec
   return_uint8: true
   depth_output_unit: mm
@@ -87,7 +56,7 @@ policy:
   output_features:
     action:
       type: ACTION
-      shape: [32]
+      shape: [14]
   device: cuda
   use_amp: false
   use_peft: false
@@ -115,14 +84,24 @@ policy:
   use_relative_actions: false
   relative_exclude_joints:
     - gripper
-  action_feature_names: null
+  action_feature_names:
+    - right_joint_1
+    - right_joint_2
+    - right_joint_3
+    - right_joint_4
+    - right_joint_5
+    - right_joint_6
+    - right_gripper
+    - left_joint_1
+    - left_joint_2
+    - left_joint_3
+    - left_joint_4
+    - left_joint_5
+    - left_joint_6
+    - left_gripper
   rtc_config: null
-  # Explicit leaf-module FSDP wrapping is incompatible with pi0.5's internal
-  # checkpoint recomputation (Tensor/DTensor mixing during backward).
   gradient_checkpointing: false
   compile_model: true
-  # Autotune kernels without CUDA graphs: safer with FSDP all-gathers and uses
-  # less persistent GPU memory than max-autotune/reduce-overhead cudagraph modes.
   compile_mode: max-autotune-no-cudagraphs
   freeze_vision_encoder: false
   train_expert_only: false
@@ -131,39 +110,33 @@ policy:
   optimizer_eps: 1.0e-8
   optimizer_weight_decay: 0.01
   optimizer_grad_clip_norm: 1.0
-  # Keep the official pi0.5 scheduler preset. LeRobot builds this scheduler in
-  # cfg.steps (micro-step) coordinates; auto-scaling yields 791 warmup steps
-  # (3% of the 26,370-step run) while retaining the 30,000-step decay preset.
-  scheduler_warmup_steps: 900
-  scheduler_decay_steps: 30000
+  scheduler_warmup_steps: 298
+  scheduler_decay_steps: 9936
   scheduler_decay_lr: 2.5e-6
   tokenizer_max_length: 200
 
 reward_model: null
-output_dir: /root/wxwu/lerobot_piper/outputs/train/piper_pi05_cap0907_bs4_ga6_ep5
-job_name: piper_pi05_cap0907_bs4_ga6_ep5
+output_dir: /root/wxwu/lerobot_piper/outputs/train/piper_pi05_place_test_tube_full_bs8_ga6_ep4_20260922
+job_name: piper_pi05_place_test_tube_full_bs8_ga6_ep4_20260922
 resume: false
 seed: 42
 cudnn_deterministic: false
 num_workers: 4
-batch_size: 4
+batch_size: 8
 prefetch_factor: 2
 persistent_workers: true
 dataloader_multiprocessing_context: spawn
-steps: 26370
+steps: 9936
 env_eval_freq: 0
 log_freq: 6
 eval_steps: 0
 max_eval_samples: 0
 tolerance_s: 0.0001
 save_checkpoint: true
-# Roughly every two epochs, aligned to GA=6. A final checkpoint is always written.
-save_freq: 8790
+save_freq: 4968
 checkpoint_format: safetensors
 use_policy_training_preset: true
 
-# validate() replaces these with the identical pi0.5 policy presets because
-# use_policy_training_preset=true. They remain explicit so this is a complete config.
 optimizer:
   type: adamw
   lr: 2.5e-5
@@ -174,8 +147,8 @@ optimizer:
 
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 900
-  num_decay_steps: 30000
+  num_warmup_steps: 298
+  num_decay_steps: 9936
   peak_lr: 2.5e-5
   decay_lr: 2.5e-6
 
@@ -193,8 +166,6 @@ accelerator:
     steps: 6
   fsdp:
     reshard_after_forward: true
-    # Proven pi0.5/FSDP2 setup from the earlier Piper run: shard leaf modules
-    # and never let the size-based policy select a ModuleList container.
     wrap_modules: [Linear, Embedding, Conv2d]
     min_num_params: null
     cpu_offload: false
@@ -230,14 +201,13 @@ ema:
   use_for_eval: true
 
 wandb:
-  enable: true
-  # Full pi0.5 checkpoints are very large; metrics/config still sync online.
+  enable: false
   disable_artifact: true
   project: lerobot-piper
   entity: null
-  notes: Full-parameter pi0.5 fine-tuning on cleaned pen-cap success demonstrations; 8 GPUs x batch=4 x GA6, warmup=3%, epochs=5.
-  run_id: null
-  mode: online
+  notes: Full-parameter PI0.5 fine-tuning on all 173 successful place-test-tube episodes; 8 GPUs x batch=8 x GA6, 4 epochs.
+  run_id: piper_pi05_place_test_tube_full_bs8_ga6_ep4_20260922
+  mode: offline
   add_tags: true
 
 peft: null
@@ -245,11 +215,13 @@ save_checkpoint_to_hub: false
 sample_weighting: null
 
 rename_map:
-  observation.images.cam_high: observation.images.base_0_rgb
-  observation.images.cam_left_wrist: observation.images.left_wrist_0_rgb
-  observation.images.cam_right_wrist: observation.images.right_wrist_0_rgb
+  observation.images.image_top: observation.images.base_0_rgb
+  observation.images.image_left: observation.images.left_wrist_0_rgb
+  observation.images.image_right: observation.images.right_wrist_0_rgb
 
 job:
   target: null
   image: huggingface/lerobot-gpu:latest
   timeout: 2d
+  detach: false
+  tags: []

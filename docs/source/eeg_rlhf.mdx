@@ -1,0 +1,164 @@
+# EEG-assisted RLHF for PI0 and PI0.5
+
+This integration implements the compact EEG-RLHF experiment with the LeRobot
+`PI0Policy` and `PI05Policy` flow-matching policies:
+
+```text
+completed PI action chunk -> frozen action-expert hidden tokens -> temporal pooling h_tau
+                                                            |-> EEG predictor -> z_hat_e
+                                                            `-> reward head -> R_tau
+post-action EEG -> frozen BrainMU-H encoder -> z_e
+```
+
+EEG is a training-only target. The reward head always receives `h_tau`; rollout
+snapshots contain only temporal pooling and the reward head.  Action windows
+are frame-stride windows: for every frame `t`, actions `[t, t+50)` form one
+chunk (with normal end-of-episode padding), rather than partitioning an episode
+into non-overlapping 50-frame blocks.  EEG is encoded from the window anchored
+at `timestamp[t]` and the two 2.5-second halves around that anchor.
+
+## Install
+
+```bash
+pip install -e ".[pi,eeg-rlhf]"
+```
+
+Raw EEG encoding uses the external BrainMU-H source tree and trusted legacy
+checkpoint. The encoder runs in the DataLoader path; no EEG latent is
+materialized ahead of training.
+
+## Extract completed-trajectory features
+
+Both `PI0Policy.extract_behavior_features()` and
+`PI05Policy.extract_behavior_features()` run the completed action chunk at flow
+time `t=0`. They return the final action-expert hidden states before
+`action_out_proj`, plus a validity mask derived from `action_is_pad`.
+
+```python
+from lerobot.datasets import EEGChunkWindowDataset, EEGWindowConfig
+
+winner_ds = EEGChunkWindowDataset(
+    lerobot_dataset,
+    winner_manifest,
+    config=EEGWindowConfig(chunk_size=50, half_window_s=2.5),
+    encoder=brainmu_encoder,
+)
+```
+
+The two batches must start from the same rollback state. PI hidden features,
+EEG windows, and EEG targets are produced on demand; only the model checkpoints
+are saved.
+
+## Pair dataset contract
+
+The RLHF entry point reads winner/loser LeRobot samples and EEG `.npz` files
+directly in the DataLoader. It never writes a tensor/feature/token cache.
+
+Required keys:
+
+```text
+observation.eeg_rlhf.winner_behavior_features  [N,T,D]
+observation.eeg_rlhf.winner_behavior_mask      [N,T]
+observation.eeg_rlhf.loser_behavior_features   [N,T,D]
+observation.eeg_rlhf.loser_behavior_mask       [N,T]
+```
+
+Invalid windows are represented by `observation.eeg_rlhf.window_valid`; the
+preference loss still runs, while EEG alignment is masked for those samples.
+
+`prepare_brainmu_h_eeg()` reproduces the Human demo preprocessing: exclude
+auxiliary channels, stable-sort and keep at most 19 channels, per-channel
+z-score, resample to 256 Hz, crop/pad to 640 samples and pad to 24 channels.
+
+## Train the scorer
+
+Train both stages from raw EEG:
+
+```bash
+lerobot-train-eeg-rlhf \
+  --stage all \
+  --dataset-repo-id ATTACH_CAP_TO_PEN_1_1 \
+  --dataset-root /data/0907 \
+  --winner-manifest /data/winner.csv \
+  --loser-manifest /data/loser.csv \
+  --pretrained-policy /data/pi05_base \
+  --policy pi05 \
+  --output-dir outputs/eeg_rlhf_scorer \
+  --eeg-tokenizer-src /path/to/Brainmu/src \
+  --eeg-checkpoint-path /path/to/unitok_tok-0507-16-rope-ft_0030000_final \
+  --trust-eeg-checkpoint \
+  --device cuda
+```
+
+Only enable `--trust-eeg-checkpoint` for an explicitly trusted legacy
+checkpoint because its metadata uses pickle.
+
+The output contains the full trainable scorer and a compact EEG-free snapshot:
+
+```text
+config.json + model.safetensors
+rollout_scorer_config.json + rollout_scorer.safetensors
+train_metrics.json
+```
+
+## One-round PI0/PI0.5 RPRO update
+
+PI0 and PI0.5 implement the FlowPRO objective with identical flow noise and
+timestep draws for the current and frozen-reference policies:
+
+```text
+r_theta(s,a) = beta / 2 * (loss_ref(s,a) - loss_theta(s,a))
+```
+
+```python
+import copy
+
+reference = copy.deepcopy(policy).eval().requires_grad_(False)
+loss, metrics = policy.compute_rpro_loss(
+    winner_batch,
+    loser_batch,
+    reference_policy=reference,
+    beta=0.1,
+    lambda_pro=1.0,
+    lambda_sft=1.0,
+    pair_weight=optional_frozen_scorer_weights,
+    success_sft_batch=optional_success_replay_batch,
+)
+loss.backward()
+optimizer.step()
+```
+
+`policy` and `reference` must both be `PI0Policy` or both be `PI05Policy`.
+Use one outer update round for the first experiment. Hard safety rules remain
+separate, and the scalar scorer output is never an action-regression target.
+Use the existing `train_expert_only=True` or PEFT/LoRA configuration when only
+the action expert and lightweight adapters should be updated.
+
+## Deployment
+
+The deployment artifact contains only the updated PI0 or PI0.5 policy and its
+normal preprocessing/action decoding. BrainMU-H, the EEG predictor, the scorer
+and the frozen reference policy remain training-time components.
+
+## Verification
+
+```bash
+pytest tests/datasets/test_eeg_rlhf.py tests/policies/common/test_preference.py
+```
+
+The real BrainMU-H checkpoint test is opt-in:
+
+```bash
+BRAINMU_H_TOKENIZER_SRC=/path/to/Brianmu_tokenizer_human_demo/src \
+BRAINMU_H_CHECKPOINT=/path/to/unitok_tok-0507-16-rope-ft_0030000_final \
+pytest tests/rewards/test_brainmu_human_integration.py
+```
+
+The real PI0 and PI0.5 CPU training smoke is also opt-in and uses substantial
+RAM while each checkpoint is loaded:
+
+```bash
+PI0_CHECKPOINT=/path/to/pi0_base \
+PI05_CHECKPOINT=/path/to/pi05_base \
+pytest tests/policies/pi0_pi05/test_eeg_rlhf_checkpoint.py
+```
